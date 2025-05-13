@@ -1,0 +1,158 @@
+---
+title: "Clean 2023 Pledger Reporting Accuracy and Counterfactuality Survey Results"
+output: html_document
+date: "`r Sys.Date()`"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r packages}
+# Load relevant packages
+pacman::p_load(tidyverse, dbplyr, gt, glue)
+```
+
+
+```{r import-raw-data}
+source("connect-parfit.R")
+
+normalize_usd_sql <- function(amount_col, currency_col, date_str) {
+  glue::glue_sql("normalize_amount_to_usd({`amount_col`}::numeric, {`currency_col`}, {date_str}::date)", .con = con)
+}
+
+
+raw_data <- tbl(con, in_schema("impact_surveys", "prac2023_raw")) %>% 
+  # Add columns with USD conversion for monetary values
+  mutate(
+    reported_2023_usd = sql(normalize_usd_sql("reported_2023", "currency_code", '2023-07-01')),
+    donations_2023_usd = sql(normalize_usd_sql("donations_2023", "currency_code", '2023-07-01')),
+    counterfactual_donations_2023_usd = sql(normalize_usd_sql("counterfactual_donations_2023", "currency_code", '2023-07-01')),
+    # I chose 2022-07-01 as the conversion date as this is roughly halfway between the average pledge_start_date of responses (2019-06-15) and when surveys were run
+    reported_total_usd = sql(normalize_usd_sql("reported_total", "currency_code", '2022-07-01')),
+    donations_total_usd = sql(normalize_usd_sql("donations_total", "currency_code", '2022-07-01'))
+    ) %>% 
+  collect() %>% 
+  # If reported_2023_usd/reported_total_usd are NA, currency_code is NA and reported_2023/reported_total_usd is zero
+  mutate(
+    reported_2023_usd = if_else(reported_2023 == 0, 0, reported_2023_usd),
+    donations_2023_usd = if_else(donations_2023 == 0, 0, donations_2023_usd),
+    counterfactual_donations_2023_usd = if_else(counterfactual_donations_2023 == 0, 0, counterfactual_donations_2023_usd),
+    reported_total_usd = if_else(reported_total == 0, 0, reported_total_usd),
+    donations_total_usd = if_else(donations_total == 0, 0, donations_total_usd),
+    # Round all USD values to nearest cent
+    across(ends_with("_usd"), \(x) round(x, 2))
+  ) 
+  
+
+```
+
+## Filter out incomplete responses
+
+First filter out survey runs, that do not constitute meaningful responses:
+
+1) That can't be linked to a respondent (because they contain no pledge_id)
+2) That don't have responses to the email question
+
+
+```{r essential-filters}
+# Get actual syrvey runs
+actual_runs <- raw_data %>% 
+  # Remove responses with no pledge id
+  filter(!is.na(pledge_id) & !is.na(accurate_2023))
+
+```
+
+## Filter to include just one run from each respondent
+
+First run an automated process to figure out which runs should be kept where possible.
+
+```{r get-run-info}
+
+run_info <- actual_runs %>% 
+  mutate(
+    survey_complete = !is.na(time_finised),
+    survey_started = 
+      # A started survey is one with the first question answered
+      # First question differs depending on response to the email question
+      !is.na(donations_2023) & accurate_2023 !="Yes" | 
+      !is.na(counterfactual_donations_2023)
+  ) %>% 
+  # Create a decision variable to decide what to do with a run
+  mutate(
+    decision = case_when(
+      n() == 1 ~ "keep", # When only one run for the person keep this run
+      n_distinct(accurate_2023) > 1 ~ "unclear", # When the person reports contradictory platform affects handle manually
+      sum(survey_started) > 1 ~ "unclear", # When the person started the survey more than once handle manually
+      survey_started ~ "keep", # Otherwise keep any runs where the survey was started
+      any(survey_started) ~ "discard", # If another run for the person was started, but this one wasn't then discard
+      row_number() == 1 ~ "keep", # If no runs were started, just keep the first run
+      .default = "discard" # Discard all the rest
+    ),
+    .by = pledge_id
+  )
+
+run_info %>% 
+  summarise(
+    `Total survey runs` = n(),
+    `Total respondents` = n_distinct(pledge_id),
+    `Keep` = sum(decision == "keep"),
+     `Discard` = sum(decision == "discard"),
+    `Unclear` = sum(decision == "unclear")
+    
+  ) %>% 
+  gt(caption = "Automated handling of survey runs") %>% 
+  tab_spanner("Run decision", 3:5)
+
+```
+
+Because the number of respondents is equal to the number of runs to keep and no run decisions are unclear, we can simply filter out the discards and have our responses.
+
+```{r get-runs}
+cleaned_runs <- run_info %>% 
+  filter(decision == "keep") 
+```
+
+## Tag likely erroneously runs
+
+Finally, add some notes to runs that seem to have anomalous results.
+
+```{r}
+note_runs <- tribble(
+  ~run, ~notes,
+  15010251, "Reported they gave nothing in 2023, but would have given more if they had never encountered GWWC. However, later in a freetext question they report they have actually donated a large amount equivalent to the amount they would have donated without GWWC to a DAF, which they intend to distribute to highly effective opportunities, in 2023. Implying GWWC hasn't really caused them to donate less.",
+  15007973, "Reported they gave nothing, but would have given more if they had never encountered GWWC, but then added that they only started the pledge in 2024 not prior to 2023",
+  15031022, "Responded to email saying they actually gave more than reported, but their donations_2023 is smaller than their reported 2023."
+)
+
+noted_runs <- cleaned_runs %>% 
+  left_join(note_runs, by = "run")
+```
+
+## Export
+
+The completely processed results are then written to Parfit
+
+```{r export-results}
+
+source("write_parfit.R")
+
+table_name <- "prac2023_clean"
+
+dbWriteTable(write_con, name = Id(schema = "impact_surveys", table = table_name), 
+             value = noted_runs, 
+             row.names = FALSE, 
+             overwrite = TRUE,
+             append = FALSE)
+
+
+time_now <- Sys.time() %>% as.character()
+
+dbExecute(write_con, glue_sql(
+  "COMMENT ON TABLE impact_surveys.{`table_name`} IS 'This table contains the survey responses collected in 2025 as part of the 2023 10% Pledge Reporting Accuracy and Counterfactuality Survey. Responses have been filtered to include one response per respondent and to USD-normalised monetary values.
+                        This version was created at: {`time_now`}
+                        More information about this survey can be found in the protocol linked in the raw survey table';",
+  .con = write_con
+))
+```
+

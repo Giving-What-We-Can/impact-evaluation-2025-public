@@ -1,0 +1,208 @@
+---
+title: "Non-pledge recording adjustment"
+output: html_document
+date: "`r Sys.Date()`"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r packages}
+pacman::p_load(tidyverse, dbplyr, gt)
+```
+
+
+```{r connect-parfit}
+# Establish read connect to parfit
+source("connect-parfit.R")
+```
+
+# Document purpose
+
+Here I aim to estimate a recording adjustment for non-pledge donations for the 2023--2024 period.
+
+# Background
+
+Prior to our spinout from Effective Ventures in 2024, GWWC's normal systems for tracking donations did not capture all payment types. In particular, we had little oversight of:
+
+- Stock donations
+- Payroll giving
+- DAF donations
+
+In order to account for donations of these types that occurred prior to spinout and that we therefore have no records of I will estimate what fraction of post-spinout donations these constitute and estimate a recording coefficient for all 2023--2024 donations based on this.
+
+# Method and results
+
+To estimate the proportion of total non-pledge donations in 2023 and 2024 that went unrecorded, we will estimate the proportion of total recorded donations of the type we have poor oversight of both prior to spinout and after spinout. We will then assume that the fraction of these donations that occurred prior to spinout was the same that occurred after spinout and use this to estimate actual non-pledge donations through the GWWC platform during 2023–2024.
+
+## Step 1: Filtering donations
+
+First we want to create a query that will get all the donations we want to include in our estimate of non-pledge donations. This means filtering to:
+
+- Include successful facilitated donations
+- Exclude pledge donations
+- Exclude donations that occurred outside of 2023 and 2024
+- Exclude donations where the donors total donations for the year exceed $140K (2024 USD)
+
+
+```{r}
+# Get non-pledge donation ids
+non_pledge <- tbl(con, in_schema("reporting", "complete_giving_report")) %>% 
+  filter(is.na(pledge_id)) %>% 
+  select(payment_id) %>% 
+  distinct()
+
+# Filter just for eligible payments
+eligible_payments <- tbl(con, in_schema("payments","payment")) %>% 
+    mutate(
+      year_month = to_char(donation_date, 'YYYY-MM'),
+      donation_year = year(donation_date)
+    )  %>%
+  # Join inflation rate
+  left_join(
+    tbl(con, in_schema("impact_surveys","inflation_data")),
+    by = join_by(donation_year == year)
+  ) %>% 
+  # Adjust for inflation and exchange rate
+  mutate(
+    amount_adj_usd = amount_normalized * cumulative_inflation_to_2024,
+    # Categorise donations as either pre or post-spinout
+    post_spinout = recipient %in% c("gwwc-uk", "gwwc-us")
+    ) %>% 
+  filter(
+    status == "succeeded", # Include successful payments
+    donation_year %in% 2023:2024, # Filter to include donations in period
+    sum(amount_adj_usd, na.rm = TRUE) <= 139e3, # Exclude where total donations exceed 140K...
+    .by = c(person_id, donation_year) # For a given person-year
+  ) %>% 
+  # Filter for non-pledge donations
+  semi_join(non_pledge, join_by(id == payment_id))
+```
+
+To see which entities handled donations made through the GWWC platform at different times, we can plot this. Since spinout, donations are mostly handled by GWWC UK and GWWC US.
+
+```{r}
+by_date_entity <- eligible_payments %>% 
+  summarise(
+    num_payments = n(),
+    recorded_amount = sum(amount_adj_usd),
+    .by = c(recipient,year_month)
+  ) %>% 
+  collect()
+
+by_date_entity %>% 
+  ggplot(aes(x = year_month, y = recorded_amount, fill = recipient)) +
+  geom_col() + 
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5))
+```
+
+## Step 2: Estimate total reconciled donations by payment method and whether it occurred pre or post-spinout
+
+The below table summarises the reconciled donations GWWC processed in 2023 and 2024, based on whether they occurred prior to or after spinout and whether they were a type of donation typically recorded in our systems prior to spinout (Other payment types) or not.
+
+```{r}
+reconciled_donations <- eligible_payments %>% 
+  mutate(payment_oversight = if_else(
+    payment_method %in% c("payroll giving", "donor advised fund", "stock", "cheque"),
+    as.character(payment_method),
+    "Other payment types"
+    )) %>% 
+  summarise(
+    total_period = sum(amount_adj_usd),
+    .by = c(post_spinout,payment_oversight)
+  ) %>% 
+  collect()
+
+reconciled_donations %>% 
+  gt(caption = "Reconciled non-pledge donations by payment type and whether they occurred before or after spinout (2023–2024)") %>% 
+  fmt_currency(3, suffixing = T)
+
+```
+
+## Step 3: Add unreconciled payments
+
+Some payments for the 2023--2024 period that occured after spinout are yet to be reconciled in our recording systems, but will be in the future. I will add these to our reconciled payments to get total donations. Arguably these should be included in the recording adjustment because they won't be included in our totals, but we won't worry about this:
+
+```{r}
+unreconciled_donations <- tribble(
+  ~payment_oversight, ~amount, ~currency_code, ~conversion_factor,
+  "payroll giving", 12e3,  "GBP", 1.29, #(From Google 31 October 2024)
+  "payroll giving", 120e3, "USD", 1,
+  "stocks",         101e3, "USD", 1
+  ) %>% 
+  summarise(
+    total_period = sum(amount * conversion_factor),
+    post_spinout = T,
+    .by = payment_oversight
+  )
+
+```
+
+Let's get a look at our total donations for 2023--2024 by whether they are a payment type GWWC typically has oversight of and whether they were made pre or post spinout:
+
+```{r}
+all_donations <- bind_rows(
+  unreconciled_donations,
+  reconciled_donations
+) %>% 
+  mutate(prespinout_oversight = payment_oversight == "Other payment types") %>% 
+  summarise(
+    total_period = sum(total_period),
+    .by = c(post_spinout, prespinout_oversight)
+  )
+
+all_donations %>% 
+  arrange(post_spinout, prespinout_oversight) %>% 
+  gt(caption =  "Known non-pledge donations by payment type and whether they occurred before or after spinout (2023–2024)") %>% 
+  fmt_currency(3, suffixing = T)
+```
+
+## Step 4: Estimate missing donations 
+
+Next, we can estimate the actual total non-pledge donations, by working out what proportion of the donations post spinout would likely not have been recorded if they occurred pre-spinout and assuming these types of donations contributed the same proportion to the total, pre spinout.
+
+```{r}
+estimate_missing <- all_donations %>% 
+  summarise(
+    total_in_database = sum(total_period),
+    recorded_type_prespinout = sum(total_period[prespinout_oversight]),
+    unrecorded_type_prespinout = sum(total_period[!prespinout_oversight]),
+    percent_of_unrecorded_type = unrecorded_type_prespinout/total_in_database,
+    .by = post_spinout
+  ) %>% 
+  mutate(
+    # Estimate actual donations
+    actual_estimate = if_else(post_spinout, 
+                     total_in_database,
+                     # Recorded donations prespinout over percent of recorded type post-spinout
+                     recorded_type_prespinout/(1-percent_of_unrecorded_type[post_spinout])
+    )
+    )
+
+
+estimate_missing %>% 
+  gt() %>% 
+  fmt_currency(c(2:4,6),suffixing = T) %>% 
+  fmt_percent(5)
+```
+
+So 12.5% of donations post spinout are of types we had minimal oversight of pre-spinout. In actual fact these types of donations still made up 1% of donations pre spinout, so we have just assumed the difference is the missing donations.
+
+## Step 5: Create a recording coefficient
+
+From this we can estimate a recording coefficient by getting estimated actual donations as a proportion of recorded donations.
+
+```{r}
+recording_coefficient <- estimate_missing %>% 
+  summarise(across(c(total_in_database, actual_estimate), sum),
+            coefficient = actual_estimate / total_in_database)
+
+recording_coefficient %>% 
+  gt(caption = "Estimated non-pledge recording coefficient for 2023–2024") %>% 
+  fmt_percent(3) %>% 
+  fmt_currency(1:2,suffixing = T)
+```
+
+

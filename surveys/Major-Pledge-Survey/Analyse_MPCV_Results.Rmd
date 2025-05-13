@@ -1,0 +1,580 @@
+---
+title: "Analysis of 2025 Major Pledge Counterfactual Value Survey Results"
+output: html_document
+date: "`r Sys.Date()`"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r packages}
+# Load relevant packages
+pacman::p_load(tidyverse, dbplyr, gt, PHEindicatormethods,jsonlite)
+```
+
+```{r params}
+theme_set(theme_bw())
+theme_update(legend.position = "bottom", plot.title.position = "plot")
+
+```
+
+```{r import-processed-data}
+# Import processed results
+source("connect-parfit.R")
+
+results <- tbl(con, in_schema("impact_surveys", "mpcv2025_clean")) %>% 
+  collect() %>% 
+  mutate(
+    gwwc_caused_donations =  donations_total - counterfactual_donations_total,
+    gwwc_caused_proportion = if_else(
+      amount_effect == "same",
+      0,
+      gwwc_caused_donations/donations_total
+    ),
+    average_annual_donations_usd = donations_total_usd / pledge_age,
+    average_annual_reported_usd = reported_total_usd / pledge_age
+  )
+```
+
+```{r import-sample}
+# Import sample
+
+sample <- tbl(con, in_schema("impact_surveys", "mpcv2025_sample"))  %>%
+  collect() %>% 
+  mutate(responded = person_id %in% results$person_id,
+         completed = person_id %in% results$person_id[results$survey_completed])
+```
+
+## Document purpose
+
+Here I will conduct quantitative analysis of the results of the 2025 Major Pledge Donor Counterfactual Value Survey, which was run as part of Giving What We Can's internal impact evaluaton for the 2023--2024 period. The aims are to:
+
+1) Determine whether there is a threshold above which major pledge donors should be excluded from inclusion in the impact evaluation altogether and, if so determine what this threshold is  
+2) Determine a counterfactuality coefficient for all major pledge donors who will be included in the survey  
+3) Determine a recording coefficient for all major pledge donors who will be included in the survey  
+
+## Survey response rates and representativeness
+
+### Response rates
+
+This survey sample was:
+
+- The 10 pledgers with the highest recorded donations in 2023
+- The 30 pledgers with the highest recorded donations of all time
+- Excluding three respondents in the latter group who had already responded to one of our 2025 surveys
+
+Because of overlap between the first two groups, the total sample comprised 29 individuals.
+
+```{r helper functions}
+# Create functions for getting response rates and creating response rate tables
+
+get_response_rates <- function(x, by_col) {
+  x %>% 
+    summarise(
+    sampled = n(),
+    responded = sum(responded),
+    completed = sum(completed),
+     .by = {{by_col}}) %>% 
+  phe_proportion(responded, sampled, "standard") %>% 
+  rename_with(~str_c("response_",.x),.cols = c(value,uppercl,lowercl)) %>% 
+  phe_proportion(completed, sampled, "standard") %>% 
+  rename_with(~str_c("complete_",.x),.cols = c(value,uppercl,lowercl)) %>% 
+  arrange({{by_col}}) 
+}
+
+make_response_rates_table <- function(x) {
+  x %>% 
+  gt() %>% 
+  fmt_percent(
+    c(starts_with("response_"), starts_with("complete_")),
+    decimals = 0) %>% 
+  cols_merge(starts_with("response_"),pattern = "{1}&nbsp;({2}&#8288;–&#8288;{3})")%>% 
+  cols_merge(starts_with("complete_"),pattern = "{1}&nbsp;({2}&#8288;–&#8288;{3})") %>% 
+  cols_label(
+    sampled ~ "Number sampled",
+    responded ~ "Number responded",
+    completed ~ "Number completed",
+    response_value ~ html("Response&nbsp;rate"),
+    complete_value ~ html("Completion&nbsp;rate")
+  )
+}
+
+# Create function for inline printing numbers
+present <- function(number, dp = 2) {sprintf(str_c("%1.",dp,"f"),number)}
+
+# Function for formatting variable names for presentation
+renamer <- function(x) str_to_sentence(str_replace_all(x,"_"," "))
+
+
+```
+
+First let's get total response rates for this survey:
+
+```{r response-rates}
+# Get response rates for whole sample
+response_rates <- sample %>%
+  get_response_rates() 
+
+response_rates  %>% 
+  make_response_rates_table()
+  
+```
+
+Response rates for this survey were `r present(100*response_rates$response_value)`%.
+
+```{r response-rates-top10-2023}
+response_rates_top102023 <- sample %>%
+  filter(`2023_top_10`) %>% 
+  get_response_rates()
+```
+
+When we just consider those who reported the most donations in 2023, we find the response rate is similar at `r present(100*response_rates_top102023$response_value)`.
+
+```{r response-rates-top10-2023-table}
+response_rates_top102023  %>% 
+  make_response_rates_table()
+
+```
+
+### Representativeness of sample
+
+One important question is to what extent do the respondents accurately represent the sample as a whole. The below graph shows that many of those who record the highest average annual donations with GWWC did not respond to the survey. This means we need to be cautious in assuming that results for respondents apply to large donors more generally. We will return to this later.
+
+```{r get-average-annual-recorded}
+reported_donations_by_responses <- tbl(con, in_schema("reporting","complete_giving_report")) %>% 
+  filter(!is.na(pledge_id))  %>% 
+  summarise(total_reported = sum(amount_normalized, na.rm = T), 
+            .by = pledge_id) %>% 
+  inner_join(
+    select(tbl(con, in_schema("pledges", "verified_active_pledge")),pledge_id = id,period),
+    by = "pledge_id"
+  ) %>% 
+  mutate(
+    start_date = lower(period),
+    pledge_age = as.numeric(today() - start_date) / 365.25,
+    average_annual_reported = total_reported / pledge_age) %>% 
+  filter(pledge_id %in% sample$pledge_id) %>%  
+  collect() %>% 
+  mutate(
+    surveyed = pledge_id %in% sample$pledge_id,
+    responded = pledge_id %in% sample$pledge_id[sample$responded]) %>% 
+  arrange(-average_annual_reported)
+
+reported_donations_by_responses %>% 
+  ggplot(aes(x = responded, y = average_annual_reported, colour = responded)) +
+  geom_point() +
+  scale_y_log10(labels = scales::label_currency()) +
+  labs( y = NULL, x = "Responded to survey", 
+        subtitle = "Average donations reported annually (USD)") +
+  theme(legend.position = "none")
+
+```
+
+
+
+## Results
+
+### Counterfactuality adjustment
+
+#### Background
+
+The question posed in the email sent to pledge donors for this survey was:
+
+> Considering all your donations to high-impact charities/funds* since you commenced your pledge on {start_date}, which of the following do you believe best describes your likely donation behaviour if you had never encountered GWWC? 
+>  
+> - I would not have donated to high-impact charities/funds at all  
+> - I would have donated less to high-impact charities/funds  
+> - I would have donated the same amount to high-impact charities/funds
+> - I would have donated more to high-impact charities/funds
+
+The responses to this question are summarised below:
+
+```{r}
+
+results %>% 
+  count(response_text) %>% 
+  mutate(pct = n / sum(n)) %>% 
+
+  gt(
+    caption = "Question: Considering all your donations to high-impact charities/funds* since you commenced your pledge on {start_date}, which of the following do you believe best describes your likely donation behaviour if you had never encountered GWWC?",
+    rowname_col = "response_text") %>% 
+  tab_stubhead("Response") %>% 
+  fmt_percent(pct)
+
+```
+
+All respondents stated that they either would have given the same amount or less to high-impact charities if they had never encountered GWWC. No respondent reported they would have donated nothing to high-impact charities if they hadn't encountered GWWC and no respondent reported they would have donated more in this scenario.
+
+#### Imputing missing values
+
+Not all respondents who responded to our initial survey question went on to complete the survey. To estimate the counterfactual coefficient, we require estimates of the average annual donations of respondents as well as estimates of the amount they gave counterfactually. Rather than ignore responses from respondents who replied to the first question but did not reply responses to subsequent questions, we imputed actual donations and counterfactual percentages for all respondents who responded to the first question. This was done as follows:
+
+- For respondents who did not confirm the accuracy of their recorded donations, we assumed their recording donations are accurate. Given our overall recording adjustment for this group (see below), this seems like a reasonably safe assumption.  
+- For the one respondent who reported GWWC affected their donations, but did not provide a precise estimate, we assume that GWWC had the average effect (in proportional terms) on this donor's donations that we had across all other respondents.
+
+Imputing the counterfactuality coefficient, is slightly more complicated. The mean among the affected group could be calculated in at least two ways: 
+
+- A simple average of the fraction of donations reported to be counterfactually caused by GWWC for each donor in this group (no weighting for donor size)
+- The estimated average amount caused by GWWC annually divided by the average amount donated annually in this group (implicitly weighted for donor size)
+
+As we can see in the table below, both methods return an average counterfactual proportion of approximately 30% for the group who report GWWC affected their donations.
+
+```{r}
+average_fraction_in_affected_group <- results %>% 
+  filter(amount_effect == "more", !is.na(gwwc_caused_proportion)) %>% 
+  summarise(
+    average_fraction_caused_by_GWWC = mean(gwwc_caused_proportion),
+    fraction_of_annual_donations_caused_by_GWWC = mean(gwwc_caused_proportion * average_annual_donations_usd) / mean(average_annual_donations_usd)
+    ) 
+
+average_fraction_in_affected_group %>% 
+  rename_with(renamer) %>% 
+  gt() %>% 
+  fmt_percent() 
+```
+
+
+Although the results are similar, I will use the approach weighted by donation size as it theoretically controls for any possible relationship between donor size and counterfactual influence and is in this way more principled.
+
+Let's create the new dataframe with the imputed average donations and GWWC-caused proportion
+
+```{r impute-missing-values}
+analysis_results <- results %>% 
+  mutate(
+    # Assume actual donations are recorded donations where no actual donation provided
+    est_average_annual_donations = if_else(
+      is.na(donations_total_usd),
+      reported_total_usd / pledge_age,
+      average_annual_donations_usd
+    ),
+    total_donations_confirmed = !is.na(donations_total_usd),
+    # Set missing proportion to average for affected group
+    # (Note that unaffected have already been set to zero)
+    est_gwwc_caused_proportion = coalesce(
+      gwwc_caused_proportion, 
+      average_fraction_in_affected_group$average_fraction_caused_by_GWWC
+      ),
+    # Create variable for flagging whether proportion is imputed or provided
+    caused_proportion_source = if_else(
+      is.na(gwwc_caused_proportion),
+      "Imputed",
+      "Provided"
+      )
+  )
+```
+
+#### Who should be excluded all together from impact estimates?
+
+Here, I try to identify whether we should introduce some cutoff, above which we do not consider donations at all in our impact evaluation. This will involve plotting the results to get an idea of whether there are large donors who could skew the result.
+
+Is there an obvious trend in amount given that implies how we should treat major donors in this impact evaluation?
+
+```{r}
+
+plot_1 <- function(df){
+  df %>% 
+    ggplot(aes(x = est_average_annual_donations, y = est_gwwc_caused_proportion, colour = total_donations_confirmed,
+             shape = caused_proportion_source)) +
+    geom_point(size = 2) +
+    labs(x = "Estimated average annual pledge donations (USD)",
+         y = NULL,
+         subtitle = "Fraction reportedly counterfactually caused by GWWC",
+         colour = "Total donations confirmed/updated?",
+         shape = "Source of GWWC caused proportion estimate") +
+    scale_y_continuous(labels = scales::label_percent(), breaks = seq(0,1,0.1),
+                       limits = c(0,1),
+                       expand = expansion(c(0,0.01))) +
+    scale_shape_manual(values = c("Provided" = 16, "Imputed" = 15)) +
+    theme(legend.box = "vertical")
+}
+
+analysis_results %>% 
+  plot_1() +
+  scale_x_continuous(labels = scales::label_currency(suffix = "M", scale = 1e-6))
+```
+
+There are two very large pledge donors whose average annual donations exceed \$1M USD per year and who both report GWWC had no counterfactual influence on the amount they have given as part of their pledge. The donations of these donors, will be excluded from our impact estimates. Earlier we found there were other donors who recorded in excess of \$1M of donations per year, but who didn't respond to our survey. Rather than assume these respondents are more similar to the major donors who donate less than \$1M per year and apply a counterfactual coefficient to this group, we will assume they are more similar to the other donors who report more than \$1M in donations per year and exclude their donations from our impact evaluation altogether. This is the cutoff we will use more generally.
+
+Because we are not including donations from these individuals in our impact evaluation, we will not include their responses in our counterfactuality adjustment for this group.
+
+
+This leaves us with the following responses:
+
+```{r}
+coefficient_results <- analysis_results %>% 
+  filter(est_average_annual_donations < 1e6)
+  
+
+coefficient_results %>% 
+  plot_1() +
+  scale_x_continuous(labels = scales::label_currency(suffix = "K", scale = 1e-3))
+
+```
+
+The number of respondents who supplied an estimate of counterfactual total donations (or those for whom this could be confidently imputed from their response to the donation accuracy question) was: `r nrow(filter(coefficient_results,!is.na(gwwc_caused_proportion)))`. (Note I am excluding the individual we imputed from the average for this estimate)
+
+#### Estimating coefficient
+
+Now to estimate the counterfactual coefficient. I will discount the result by the response rate (50% discount for best guess and 75% discount for conservative estimate). Note the response rate I use will be that excluding donors who give more than $1M on average per year.
+
+```{r}
+# Create function for getting discounted coefficient from original coefficient,
+# response rate and discount rate
+nonresponse_discounter <- function(respondent_value, response_rate, adj){
+  respondent_value * response_rate +  respondent_value * (1-response_rate) * adj
+}
+
+# Get respondents we have excluded
+excluded_respondents <- analysis_results %>% 
+   filter(est_average_annual_donations >= 1e6) %>% 
+  pull(pledge_id)
+
+# Get the relevant sample for the denominator of our response rate
+relevant_sample <- reported_donations_by_responses %>% 
+  filter(
+    average_annual_reported < 1e6,
+    !pledge_id %in% c(excluded_respondents)
+    )
+
+
+counterfactuality_coefficients <- coefficient_results %>% 
+  summarise(
+    average_annual_donations_of_respondents = sum(est_average_annual_donations),
+    implied_gwwc_caused_annual_donations = sum(est_average_annual_donations * est_gwwc_caused_proportion),
+    implied_counterfactual_coefficient = implied_gwwc_caused_annual_donations/average_annual_donations_of_respondents,
+    simple_average_gwwc_caused_proportion = mean(est_gwwc_caused_proportion),
+    response_rate = n()/nrow(relevant_sample),
+    implied_coefficient_response_rate_adj_50pct = nonresponse_discounter(implied_counterfactual_coefficient, response_rate, 0.5),
+    implied_coefficient_response_rate_adj_25pct = nonresponse_discounter(implied_counterfactual_coefficient, response_rate, 0.25)
+  ) 
+
+counterfactuality_coefficients %>% 
+  rename_with(renamer) %>% 
+  gt(caption = "Estimated counterfactuality coefficient for major pledge donors (excluding two mega donors)") %>% 
+  fmt_currency(
+    1:2
+  ) %>% 
+  fmt_percent(3:7)
+```
+
+The overall (non-discounted) counterfactual coefficient among respondents is `r present(counterfactuality_coefficients$implied_counterfactual_coefficient*100)`%. This counterfactuality coefficient follows the trend of the results seen in our general pledger counterfactual value survey, where the counterfactual coefficient was smaller for pledgers who reported more in total donations. The largest group in this survey had a counterfactual coefficient of ~35%.
+
+It is plausible that this large counterfactuality coefficient is driven by a specific type of donor: for example, maybe the pledgers who gave more historically were more/less counterfactual than those who give more now. Alternatively, maybe those who donate large amounts consistently are more/less counterfactual than those who have made very large one of donations. To get a quick sense check for this, I will see what the counterfactuality coefficients would be if we only included the donations of those who were among the top 10 donors in 2023 (all of whom donated >425K in 2024). 
+
+```{r}
+coefficient_results %>% 
+  filter(person_id %in% sample$person_id[sample$`2023_top_10`]) %>% 
+  summarise(
+    average_annual_donations_of_respondents = sum(est_average_annual_donations),
+    implied_gwwc_caused_annual_donations = sum(est_average_annual_donations * est_gwwc_caused_proportion),
+    implied_counterfactual_coefficient = implied_gwwc_caused_annual_donations/average_annual_donations_of_respondents,
+    simple_average_gwwc_caused_proportion = mean(est_gwwc_caused_proportion)
+  ) %>% 
+  rename_with(renamer) %>% 
+  gt(caption = "Counterfactuality coefficient among surveyed Top 10 (recorded) 2023 pledge donors") %>% 
+  fmt_currency(
+    1:2
+  ) %>% 
+  fmt_percent(3:4)
+  
+
+```
+
+As the counterfactuality coefficient is relatively similar for this group, this provides some evidence that this effect is not restricted to longstanding donors.
+
+#### Other counterfactuality results
+
+##### Counterfactual activities
+
+First, what GWWC activities did respondents report influenced the amount they donated to high-impact charities and funds in 2024. This question was asked to respondents who reported that GWWC had an affect on the amount they donated:
+
+```{r}
+default_options <- c("The 🔸10% Pledge or 🔹Trial Pledge", "Our giving recommendations","The donation platform allowing you to donate to a wide range of charities","The donation platform allowing you to donate tax-deductibly.","Our research content (e.g., our cause pages, charity pages, why we recommend funds, etc.)","Our events (e.g. Effective Giving Day)","Members of the Giving What We Can community","Members of our team", "Other")
+
+# Get results for those who responded to this question
+responded_to_activities <- results %>% 
+   filter(!is.na(counterfactual_activities))
+
+responded_to_activities %>% 
+  # reframe from JSON to list all activities
+  reframe(activities = lapply(counterfactual_activities, function(s) {
+    if (is.na(s)) return(NA)
+    fromJSON(s)
+    }) %>% unlist
+) %>% 
+  mutate(activities = factor(activities, default_options)) %>% 
+  arrange(activities) %>% 
+  summarise(
+    Respondents.Number = n(),
+    Respondents.Percent = n()/nrow(responded_to_activities),
+    .by = activities) %>% 
+  gt(
+    caption = sprintf("Question: What part(s) of Giving What We Can have affected *how much* you donate to high-impact charities/funds? (Respondents: n = %i)",nrow(responded_to_activities)),
+    rowname_col = "activities"
+    ) %>% 
+  tab_spanner_delim(".") %>% 
+  fmt_percent(ends_with("Percent"))
+```
+
+##### Donation allocation effects
+
+#### Affects charity choice
+
+> If you had never encountered Giving What We Can, *do you believe you would have donated to the same high-impact charities/funds* as you have since you started your pledge on {start_date}? 
+>
+> - Yes
+> - No
+
+Among all respondents we see that about 20% of respondents GWWC affected which charities/funds they donated to:
+
+```{r}
+
+ results %>% 
+  filter(!is.na(where_effect)) %>% 
+  count(where_effect) %>% 
+  mutate(pct = n / sum(n)) %>% 
+  arrange(where_effect) %>% 
+  gt(
+    caption = "Has GWWC affected which charities/funds pledgers gave to since their pledge commenced? [All respondents]",
+    groupname_col = "value_quintile",
+    rowname_col = "where_effect") %>% 
+  fmt_percent(pct)
+
+
+```
+
+
+This was relatively consistent between those who reported that GWWC had no effect on the amount they donated to high-impact charities and those who reported GWWC had caused them to donate more.
+
+```{r}
+ results %>%
+  filter(!is.na(where_effect)) %>% 
+  count(where_effect, amount_effect) %>% 
+  mutate(pct = n / sum(n), .by = amount_effect) %>% 
+  arrange( amount_effect, where_effect) %>% 
+
+  gt(
+    caption = "Has GWWC affected which charities/funds pledgers gave to since their pledge commenced? [By amount effect on amount]",
+    groupname_col = "amount_effect",
+    rowname_col = "no_where_effect") %>% 
+  fmt_percent(pct)
+
+```
+ 
+
+
+
+#### Counterfactuality conclusions from analysis
+
+1. Donations from donors who give more than $1M per year on average will be excluded from the impact evaluation altogether.
+2. For the donations from the remaining large donors, our best guess counterfactuality coefficient is `r  present(100*counterfactuality_coefficients$implied_coefficient_response_rate_adj_50pct)`% and our conservative coefficient is `r present(100*counterfactuality_coefficients$implied_coefficient_response_rate_adj_25pct)`%.
+
+### Recording adjustment
+
+To estimate the recording adjustment from this survey results, we can assess how the average recorded pledge donations for this group compare to total annual pledge donations. Again we will use the results which exclude the very large donors.
+
+First, we will assess the responses to the first question on this topic in the survey:
+
+> Since your 🔸10% Pledge commenced on {start_date}, our records show you have donated {currency_symbol}{reported_total} {currency_code} *in total* to high-impact charities/funds. Is this roughly accurate?
+>
+>	- Yes, this is accurate to within 5%
+> - No, this is not accurate
+
+
+```{r}
+coefficient_results %>% 
+  count(donations_accurate) %>% 
+  mutate(pct = n/sum(n),
+         donations_accurate = coalesce(donations_accurate, "No response")) %>%
+  gt(caption = "Question: Since your 🔸10% Pledge commenced on {start_date}, our records show you have donated {currency_symbol}{reported_total} {currency_code} *in total* to high-impact charities/funds. Is this roughly accurate?") %>% 
+  fmt_percent(pct) %>% 
+  cols_label(donations_accurate~ "Response",n~ "Number",pct~ "Per cent")
+  
+```
+
+For the calculation of the recording adjustment for this group, we will rely solely on the responses of those who did answer the question, ignoring the 2 who did not (because they did not complete the survey).
+
+Those who reported the recorded donations were not accurate, were asked the following question:
+
+> Since your 🔸10% Pledge commenced on {start_date}, roughly *how much have you donated in total* to high-impact charities/funds?
+
+The number of respondents who supplied an estimate of actual total donations (or those for whom this could be imputed from their response to the donation accuracy question) was: `r nrow(filter(coefficient_results,!is.na(donations_total)))`.
+
+Of those who reported their donations were not accurate, one respondent did not provide an estimate of actual donations:
+
+```{r}
+coefficient_results %>% 
+  filter(donations_accurate == "No, this is not accurate") %>% 
+  summarise(Respondents = n(), No_updated_value = sum(is.na(donations_total))) %>% 
+  gt()
+```
+
+
+Among those who did provide a value, we can estimate the recording coefficient and apply this value to the respondent whose reported donations were inaccurate, but who didn't specify further.
+
+To estimate the coefficient we sum the annual average recorded donations into a total and the annual average actual donations into another total. Total donations as a proportion of recorded donations is equivalent to our recording coefficient for this group.
+
+```{r}
+recording_coefficient_any_effect <- coefficient_results %>% 
+  filter(donations_accurate == "No, this is not accurate" &
+           !is.na(donations_total)) %>% 
+  summarise(
+    number_respondents = n(),
+    number_recorded_too_low =  sum(average_annual_donations_usd > average_annual_reported_usd),
+    number_recorded_too_high =  sum(average_annual_donations_usd < average_annual_reported_usd),
+
+    total_annual_recorded = sum(average_annual_reported_usd),
+    total_annual_actual = sum(average_annual_donations_usd),
+    implied_coefficient_for_group = total_annual_actual/total_annual_recorded
+      ) 
+
+recording_coefficient_any_effect %>% 
+  rename_with(renamer) %>% 
+  gt(caption = "Recording coefficient among respondents whose recorded donations were inaccurate") %>% 
+  tab_spanner_delim(".") %>% 
+  fmt_currency(suffixing = T) %>% 
+  fmt_number(decimals = 0, starts_with("number")) %>% 
+  fmt_percent(contains("coef"))
+```
+
+If we apply this recording adjustment (`r present(100*recording_coefficient_any_effect$implied_coefficient_for_group)`%) to all respondents who said their donation records were inaccurate to estimate unrecorded  annual donations for the whole group then we calculate total reported donations for the whole group, we can estimate an overall recording adjustment in a few steps.
+
+```{r}
+recording_coefficient <- coefficient_results %>% 
+  filter(!is.na(donations_accurate)) %>% 
+  summarise(
+    # Get total recorded in the 'inaccurate recording' group
+    inaccurate_group.total_annual_recorded = 
+      sum(average_annual_reported_usd[donations_accurate == "No, this is not accurate"]),
+    inaccurate_group.recording_coefficient = recording_coefficient_any_effect$implied_coefficient_for_group,
+    # Multiply total recorded by the recording coefficient for this group to get estimated actual donations
+    inaccurate_group.total_annual_actual = 
+      inaccurate_group.total_annual_recorded * inaccurate_group.recording_coefficient,
+    # Estimate missing donations for this group, which is equivalent to missing donations for all respondents
+    inaccurate_group.missing_donations = 
+      inaccurate_group.total_annual_actual - inaccurate_group.total_annual_recorded,
+    # Estimate total annual recorded donations 
+    all_respondents.total_annual_recorded = 
+       sum(average_annual_reported_usd),
+    # Estimate total by adding the total across all respondents and the diff in the inaccurate group
+    all_respondents.total_annual_actual =
+      all_respondents.total_annual_recorded + inaccurate_group.missing_donations,
+    # Get recording coefficient
+    all_respondents.recording_coefficient = 
+      all_respondents.total_annual_actual/all_respondents.total_annual_recorded
+  ) 
+
+recording_coefficient %>% 
+  rename_with(renamer) %>% 
+  gt("Recording coefficient among all respondents") %>% 
+  tab_spanner_delim(".") %>% 
+  fmt_currency(suffixing = T) %>% 
+  fmt_percent(contains("coef"))
+```
+
+#### Recording coefficient conclusions
+
+Overall, the recording adjustment for this group is close to one at `r present(100*recording_coefficient$all_respondents.recording_coefficient)`%.
+
+

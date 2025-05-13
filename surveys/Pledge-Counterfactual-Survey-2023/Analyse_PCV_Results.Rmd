@@ -1,0 +1,616 @@
+---
+title: "Analysis of 2023 Pledge Counterfactual Value Survey Results"
+output: html_document
+date: "`r Sys.Date()`"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r packages}
+# Load relevant packages
+pacman::p_load(tidyverse, dbplyr, gt, PHEindicatormethods,jsonlite)
+```
+
+```{r params}
+theme_set(theme_bw())
+theme_update(legend.position = "bottom", plot.title.position = "plot")
+
+```
+
+```{r import-processed-data}
+# Import processed results
+source("connect-parfit.R")
+
+results_old_quintiles <- tbl(con, in_schema("impact_surveys", "pcv2023_clean")) %>% 
+  collect() %>% 
+  arrange(amount_effect) %>% 
+  mutate(amount_effect_name = factor(amount_effect, amount_effect, amount_effect_name))
+```
+
+```{r helper-functions}
+# Function for making columns readable
+label_columns <- function(x) str_to_sentence(str_replace_all(x,"_"," "))
+```
+
+
+
+## Document purpose
+
+Here I will conduct quantitative analysis of the results of the 2023 Pledge Counterfactual Value Survey, which was run as part of Giving What We Can's internal impact evaluaton for the 2023--2024 period. The primary purpose of this is to estimate a counterfactuality and recording coefficient for GWWC pledgers.
+
+## Quintile correction
+
+After we sent out the survey, we realised that there was an error in our sampling method that meant the quintiles we had sampled from were not accurate representations of the actual value quintiles. Specifically, we excluded the pledge recording accuracy survey sample BEFORE allocating donors to quintiles, instead of after allocating donors to quintiles. Because the pledge recording accuracy survey used a non-random sample with respect to donation amount, this means we underestimated the contribution of donors in the upper quintiles. Here I try to properly estimate which quintile each of the the respondents actually belong to.
+
+First let's estimate the actual 2023 value quintiles of all pledgers (excluding our major pledgers):
+
+```{r}
+pledge_donations_2023_by_pledger <- tbl(
+  con, dbplyr::in_schema("reporting", "complete_giving_report")
+  ) %>% 
+  filter(year(donation_date) == 2023,
+         !is.na(pledge_id)) %>% 
+  # Get total usd-normalised recorded 2023 donations by pledger
+  summarise(current_recorded_2023 = sum(amount_normalized, na.rm = T), .by = pledge_id)
+  
+
+eligible_pledgers_with_2023_quintiles <- tbl(
+  con, dbplyr::in_schema("pledges", "verified_active_pledge")
+  ) %>% 
+  filter(
+    pledge_type == "giving_what_we_can",  # 10% Pledge
+    year(created_at) <= 2022, # Created before start_year
+    between(year(lower(period)), 2009, 2022) # Pledge started before year
+  ) %>%   
+  select(pledge_id = id, person_id) %>% 
+  # Exclude major pledgers
+  anti_join(
+     tbl(con, dbplyr::in_schema("impact_surveys", "mpcv2025_sample")),
+     by = join_by(person_id)
+  ) %>% 
+  # Join 2023 recorded donations
+  left_join(pledge_donations_2023_by_pledger, by = join_by(pledge_id)) %>% 
+  # Set those with no recorded donations to 0
+  mutate(current_recorded_2023 = coalesce(current_recorded_2023, 0)) %>% 
+  collect() %>% 
+  # GET QUINTILES
+  # Arrange in descending order of total donations
+  arrange(desc(current_recorded_2023)) %>%
+  mutate(
+    cum_share = cumsum(current_recorded_2023) / sum(current_recorded_2023),
+    value_quintile = case_when(
+      cum_share <= 0.2 ~ 1,
+      cum_share <= 0.4 ~ 2,
+      cum_share <= 0.6 ~ 3,
+      cum_share <= 0.8 ~ 4,
+      TRUE ~ 5
+    )
+  ) %>% 
+  select(pledge_id, current_recorded_2023, value_quintile)
+```
+
+
+Now let's compare the old value quintiles to the new:
+
+```{r import-sample}
+# Import sample
+
+sample_old_quintiles <- tbl(con, in_schema("impact_surveys", "pcv2023_sample"))  %>% 
+  collect() %>% 
+  # Determine response status of sampled pledger 
+  mutate(
+    responded = pledge_id %in% results_old_quintiles$pledge_id,
+    completed = pledge_id %in% results_old_quintiles$pledge_id[
+      results_old_quintiles$survey_completed
+      ])
+```
+
+```{r count_quintiles}
+# Count the number in sample from the old and corrected quintiles
+count_old_quintiles <- sample_old_quintiles %>% 
+  count(value_quintile, name = "Number.Original in population")
+
+# Update sample to use new quintiles
+sample <- sample_old_quintiles %>% 
+  select(-value_quintile) %>% 
+  left_join(eligible_pledgers_with_2023_quintiles, by = join_by(pledge_id))
+
+# Count number in new quintiles
+count_new_quintiles <-  sample %>% 
+  count(value_quintile, name = "Number.Corrected in sample")
+
+# Count number in new quintiles in whole population
+count_new_quintiles_pop <- eligible_pledgers_with_2023_quintiles %>% 
+  count(value_quintile, name = "Number.Corrected in population")
+
+# Tabulate
+left_join(count_old_quintiles,count_new_quintiles, by = "value_quintile") %>% 
+  left_join(count_new_quintiles_pop, by = "value_quintile") %>% 
+  gt(caption = "Number in sample by original and corrected value quintile") %>% 
+  tab_spanner_delim(".") %>% 
+  cols_label(value_quintile ~ "Value quintile")
+```
+
+This looks how we would expect: the larger donor quintiles have shrunk as we have added back in the donations of the large donors who had already been sampled from these quintiles. Ultimately, we are still fully sampling the top two quintiles (across this survey and the pledge recording accuracy survey), so the only consequence of this error is that we are sampling more pledgers than we intended to in the lower quintiles. As we are taking a weighted estimate, this should have no effect on the result. Let's replace the old quintiles with the new in the results, for our analysis:
+
+```{r update-result-quintiles}
+# Update result quintiles
+results <- results_old_quintiles %>% 
+  select(-value_quintile) %>% 
+  left_join(
+    mutate(eligible_pledgers_with_2023_quintiles, pledge_id = as.double(pledge_id)), 
+    by = join_by(pledge_id))
+  
+```
+
+
+## Survey response rates and representativeness
+
+### Response rates
+
+This survey included a stratified sample, of up to 150 pledge donors from each of the following groups (when ordered by total 2023 pledge donations recorded via the GWWC platform):
+
+1) Those contributing to the first quintile of total 2023 pledge donations
+2) Those contributing to the second quintile of total 2023 pledge donations
+3) Those contributing to the third quintile of total 2023 pledge donations
+4) Those contributing to the fourth quintile of total 2023 pledge donations
+5) Those contributing to the fifth quintile of total 2023 pledge donations
+
+Excluding the top 10 pledge donors for 2023.
+
+We will analyse response rates  by these 'value quintiles':
+
+```{r}
+get_response_rates <- function(x, by_col) {
+  x %>% 
+    summarise(
+    sampled = n(),
+    responded = sum(responded),
+    completed = sum(completed),
+     .by = {{by_col}}) %>% 
+  phe_proportion(responded, sampled, "standard") %>% 
+  rename_with(~str_c("response_",.x),.cols = c(value,uppercl,lowercl)) %>% 
+  phe_proportion(completed, sampled, "standard") %>% 
+  rename_with(~str_c("complete_",.x),.cols = c(value,uppercl,lowercl)) %>% 
+  arrange({{by_col}}) 
+}
+
+make_response_rates_table <- function(x) {
+  x %>% 
+  gt() %>% 
+  fmt_percent(
+    c(starts_with("response_"), starts_with("complete_")),
+    decimals = 0) %>% 
+  cols_merge(starts_with("response_"),pattern = "{1}&nbsp;({2}&#8288;–&#8288;{3})")%>% 
+  cols_merge(starts_with("complete_"),pattern = "{1}&nbsp;({2}&#8288;–&#8288;{3})") %>% 
+  cols_label(
+    sampled ~ "Number sampled",
+    responded ~ "Number responded",
+    completed ~ "Number completed",
+    response_value ~ html("Response&nbsp;rate"),
+    complete_value ~ html("Completion&nbsp;rate")
+  )
+}
+
+
+response_rates <- sample %>%
+  get_response_rates(value_quintile) 
+
+response_rates %>% 
+  bind_rows(get_response_rates(sample)) %>% 
+  mutate(value_quintile = coalesce(as.character(value_quintile), "Total")) %>% 
+  rename(`Value quintile` = value_quintile) %>%
+  make_response_rates_table()
+  
+```
+
+As we can see, response rates were higher for the pledgers with higher reported donations in 2023. However all groups returned fairly high response rates of above 26% or higher.
+
+### Sample representativeness
+
+One thing we want to ascertain is how representative of the entire sample, the respondents really are. As a first step here, we consider how the amount respondents report donating compares to the amount the sample as a whole reports donating. Since we muddled the quintiles, I will also make sure that the sample is representative of the corrected quintiles.
+
+```{r representativeness-by-sample-type}
+# Create function for summarising the donations of a population
+donations_summary <- function(df,group_col) {
+  df %>% 
+    summarise(
+      n = n(),
+      `Reported Donations_Mean` = mean(usd_donations),
+      `Reported Donations_SD` = sd(usd_donations),
+      Percentile_75           = quantile(usd_donations, 0.75),
+      Percentile_90          = quantile(usd_donations, 0.9),
+      Percentile_95     = quantile(usd_donations, 0.95),
+      .by = {{group_col}}
+    )
+}
+
+population <- eligible_pledgers_with_2023_quintiles %>% 
+  filter(current_recorded_2023 >0) %>% 
+  rename(usd_donations = current_recorded_2023)
+
+bind_rows(
+  list(
+    `Sampled population` = donations_summary(population,value_quintile),
+    Sample = donations_summary(sample,value_quintile),
+    Respondents = donations_summary(filter(sample, responded),value_quintile),
+    Completed = donations_summary(filter(sample, completed),value_quintile)
+    ),
+  
+  .id = "Group"
+) %>% 
+  arrange(value_quintile,Group) %>% 
+  gt(groupname_col = "value_quintile") %>% 
+  tab_spanner_delim("_") %>% 
+  fmt_currency(suffixing = T) %>% 
+  fmt_number(n, decimals = 0) 
+```
+
+In terms of recorded donations, the respondents are fairly representative of the sample as a whole, however there is some overrepresentation of larger donors, particularly in the bottom and top value-quintile respondents.
+
+## Results
+
+### Counterfactuality adjustment
+
+#### Background
+
+The question posed in the email sent to pledge donors for this survey was:
+
+> Roughly what fraction of the amount you have donated to high-impact charities/funds as a part of your 🔸10% Pledge that commenced on {start_date} would you still have donated to high-impact charities/funds if you had never encountered GWWC?
+>
+> - more (110% or more of actual donations)
+> - about the same amount (between 90% and 110% of actual donations)
+> - a bit less (less than 90%, but more than 60% of actual donations)
+> - roughly half as much (between 40% and 60% of actual donations)
+> - a lot less (less than 40%, but more than 10% of actual donations) 
+> - close to none (10% or less of actual donations)
+> - I really have no idea
+
+All respondents provided an answer to this question.
+
+First, what responses did we receive to these questions, by value quintile?
+
+```{r}
+
+results %>% 
+   mutate(value_quintile = str_c( "Quintile ", value_quintile)) %>% 
+  bind_rows(mutate(results, value_quintile = "All respondents")) %>% 
+  count(value_quintile, amount_effect_name) %>% 
+  mutate(pct = n / sum(n), .by = value_quintile) %>% 
+  arrange(value_quintile, amount_effect_name) %>% 
+
+  gt(
+    caption = "Question: Roughly what fraction of the amount you have donated to high-impact charities/funds as a part of your 🔸10% Pledge that commenced on {start_date} would you still have donated to high-impact charities/funds if you had never encountered GWWC?",
+    groupname_col = "value_quintile",
+    rowname_col = "amount_effect_name") %>% 
+  fmt_percent(pct)
+
+```
+
+Across all respondents, about 15% of respondents reported GWWC had no effect or a negative effect on the amount they gave to high-impact charities, 6.5% reported they were unsure and the rest of the respondents reported that GWWC caused them to donate more. The donors who reported the most donations to GWWC were also those who were most likely to report GWWC had no effect on the amount they donated. This seems consistent with results we have seen in other surveys. It is worth noting though that approximately 45% of this group still reported that GWWC increased the amount they donated to high-impact charities/funds/
+
+In total, three respondents reported that they would have donated more to high-impact charities/funds if they had never encountered GWWC. These respondents did not provide any responses to our free-text questions and so we have no information on how GWWC caused them to give less or how much they would have given if they hadn't encountered GWWC.
+
+
+#### Reported-donations-weighted estimate
+
+Here we use the results of the survey to estimate a counterfactual coefficient for pledgers. Our method for estimating the counterfactual coefficient will consist of estimating a counterfactual adjustment for each 2023 value quintile and averaging these to come up with the overall counterfactual coefficient for this group (2023 pledge donors excluding major pledge donors surveyed separately).
+
+The method for estimating the counterfactual coefficient for each value quintile can be explained as follows (excluding those who responded they had no idea):
+
+- Estimate 2023 donations counterfactually caused by GWWC for each respondent: Multiply 2023 reported donations by the counterfactual factor that corresponds to their response to the email question (see table below)    
+- Estimate respondents' 2023 donations counterfactually caused by GWWC for each 2023 value quintile: This is estimated by summing estimated counterfactual 2023 donations across each quintile
+- Estimate counterfactual coefficient among respondents by value quintile: Divide the estimate of respondents' 2023 donations counterfactually caused by GWWC by the total 2023 reported donations for each quintile
+- Estimate the coefficient for the whole population (including non-respondents), for each quintile: Multiply the respondent coefficient by the response rate for the quintile and then apply a discounted coefficient by the non-response rate
+
+The table below shows the counterfactual factor used for each respondent based on their response to the email question:
+
+```{r}
+results %>% 
+  filter(amount_effect != -99) %>% 
+  select(`Question response` = amount_effect_name, 
+         `Individual counterfactual factor` = amount_effect) %>% 
+  unique() %>% 
+  gt(caption = "Counterfactual factor applied to 2023 reported donations by response to email question")
+```
+
+
+As the table above shows, for this estimate, we assume that those who said GWWC caused them to donate less would have donated twice as much if they had not encountered GWWC. 
+
+
+To get the overall counterfactuality coefficient, we average the coefficients across the value quintiles.
+
+```{r}
+counterfactual_estimate_inputs <- results %>% 
+  # Exclude those who had no idea what effect GWWC had on their giving
+  filter(amount_effect != -99) %>% 
+  # Estimate counterfactual GWWC-caused donations for each person
+  mutate(counterfacutal_usd = usd_donations * amount_effect) %>% 
+  summarise(
+    total_donations_2023 = sum(usd_donations),
+    counterfactual_donations_2023 = sum(counterfacutal_usd),
+    respondent_counterfactual_percentage = counterfactual_donations_2023 / total_donations_2023,
+    .by = value_quintile
+  ) %>% 
+  arrange(value_quintile) %>% 
+  left_join(select(response_rates, value_quintile, response_rate = response_value),
+            by = "value_quintile") %>% 
+  mutate(
+    counterfactual_coefficient.discount_50pct = 
+      respondent_counterfactual_percentage * response_rate + 
+      respondent_counterfactual_percentage * 0.5 * (1- response_rate),
+    
+      counterfactual_coefficient.discount_75pct = 
+      respondent_counterfactual_percentage * response_rate + 
+      respondent_counterfactual_percentage * 0.25 * (1- response_rate)
+  )
+
+
+counterfactual_estimate_inputs %>% 
+  rename_with(label_columns) %>% 
+  gt(caption = "Table for estimating the proportion of pledge donations that occur counterfactually because of GWWC") %>%
+  tab_spanner_delim(".") %>% 
+  fmt_currency(contains("donations"), suffixing = T) %>% 
+  fmt_percent(ends_with(c("percentage","rate","pct"))) %>% 
+  grand_summary_rows(
+    columns = c(ends_with(c("percentage","pct"))),
+    fns = list("Counterfactual coefficient" ~ mean(.x)),
+    fmt = ~fmt_percent(.x)
+  )
+
+```
+
+#### Counterfactuality adjustment conclusions
+
+- These results imply a conservative counterfactuality coefficient of `r 100*mean(counterfactual_estimate_inputs$counterfactual_coefficient.discount_75pct)`% and a best guess counterfactuality coefficient of `r 100*mean(counterfactual_estimate_inputs$counterfactual_coefficient.discount_50pct)`%
+
+### Other counterfactuality results
+
+#### Counterfactual activities
+
+First, what GWWC activities did respondents report influenced the amount they donated to high-impact charities and funds in 2024. This question was asked to respondents who reported that GWWC had an affect on the amount they donated:
+
+```{r}
+default_options <- c("The 🔸10% Pledge or 🔹Trial Pledge", "Our giving recommendations","The donation platform allowing you to donate to a wide range of charities","The donation platform allowing you to donate tax-deductibly.","Our research content (e.g., our cause pages, charity pages, why we recommend funds, etc.)","Our events (e.g. Effective Giving Day)","Members of the Giving What We Can community","Members of our team", "Other")
+
+# Get results for those who responded to this question
+responded_to_activities <- results %>% 
+   filter(!is.na(counterfactual_activities))
+
+responded_to_activities %>% 
+  # reframe from JSON to list all activities
+  reframe(activities = lapply(counterfactual_activities, function(s) {
+    if (is.na(s)) return(NA)
+    fromJSON(s)
+    }) %>% unlist
+) %>% 
+  mutate(activities = factor(activities, default_options)) %>% 
+  summarise(
+    Respondents.Number = n(),
+    Respondents.Percent = n()/nrow(responded_to_activities),
+    .by = activities) %>% 
+  gt(
+    caption = sprintf("Question: What part(s) of Giving What We Can have affected *how much* you donate to high-impact charities/funds? (Respondents: n = %i)",nrow(responded_to_activities)),
+    rowname_col = "activities"
+    ) %>% 
+  tab_spanner_delim(".") %>% 
+  fmt_percent(ends_with("Percent"))
+```
+
+
+
+#### Affects charity choice
+
+> If you had never encountered Giving What We Can, *do you believe you would have donated to the same high-impact charities/funds* as you have since you started your 🔸10% Pledge on {start_date}?  
+>
+> - Yes
+> - No
+
+Among all respondents we see that about half reported that GWWC affected which charities/funds they donated to:
+
+```{r}
+
+ results %>% 
+  filter(!is.na(no_where_effect)) %>% 
+  mutate(value_quintile = str_c( "Quintile ", value_quintile)) %>% 
+  bind_rows(mutate(., value_quintile = "All respondents")) %>% 
+  count(value_quintile, no_where_effect) %>% 
+  mutate(pct = n / sum(n), .by = value_quintile) %>% 
+  arrange(value_quintile, no_where_effect) %>% 
+
+  gt(
+    caption = "Question: If you had never encountered Giving What We Can, *do you believe you would have donated to the same high-impact charities/funds* as you have since you started your 🔸10% Pledge on {start_date}? [All respondents]",
+    groupname_col = "value_quintile",
+    rowname_col = "no_where_effect") %>% 
+  fmt_percent(pct)
+
+
+```
+
+
+However, among those who reported that GWWC had no effect (or a negative effect) on the amount they donated to high-impact charities, a small minority reported that GWWC affected which charities/funds they donated to:
+
+```{r}
+ results %>%
+  filter(!is.na(no_where_effect), amount_effect %in% c(0,-1)) %>% 
+  mutate(value_quintile = str_c( "Quintile ", value_quintile)) %>% 
+  bind_rows(mutate(., value_quintile = "All quintiles")) %>% 
+  count(value_quintile, no_where_effect) %>% 
+  mutate(pct = n / sum(n), .by = value_quintile) %>% 
+  arrange(value_quintile, no_where_effect) %>% 
+
+  gt(
+    caption = "Question: If you had never encountered Giving What We Can, *do you believe you would have donated to the same high-impact charities/funds* as you have since you started your 🔸10% Pledge on {start_date}? [No GWWC affect on amount]",
+    groupname_col = "value_quintile",
+    rowname_col = "no_where_effect") %>% 
+  fmt_percent(pct)
+
+```
+
+## Recording coefficient
+
+### Opening question
+
+The opening question of the section of the survey on record accuracy asked:
+
+> In calendar year 2023, our records indicate that you donated {currency_symbol}{reported_2023} {currency_code} to high-impact charities/funds. Is this roughly accurate?  
+>  
+> - Yes, this is accurate to within 5%  
+> - No, this is not accurate
+
+Overall `r nrow(filter(results,!is.na(donations_accurate)))`, respondents provided a response to this question. 
+
+Response rates to this question by quintile were as follows:
+
+```{r}
+responded_donation_accuracy <- results %>% 
+
+  filter(!is.na(donations_accurate)) %>% 
+  pull(pledge_id)
+
+sample %>% 
+  bind_rows(mutate(.,value_quintile = 99)) %>% 
+  summarise(
+    sample =  n(),
+    num_question_respondents = sum(pledge_id %in% responded_donation_accuracy),
+    question_response_rate = num_question_respondents/sample,
+    .by = value_quintile
+  ) %>% 
+  mutate(value_quintile = factor(
+    value_quintile,
+    c(1:5,99),
+    c(str_c("Quintile ",1:5), "All respondents")
+    
+  )) %>%
+  gt(caption = "Response rates to 2023 record accuracy question") %>% 
+  cols_label_with(fn=label_columns) %>% 
+  fmt_percent(ends_with("rate"))
+
+```
+
+
+Their responses are provided below:
+
+```{r}
+results %>% 
+
+  filter(!is.na(donations_accurate)) %>% 
+  mutate(value_quintile = str_c( "Quintile ", value_quintile)) %>% 
+  bind_rows(mutate(., value_quintile = "All quintiles")) %>% 
+  count(value_quintile, donations_accurate) %>% 
+  mutate(pct = n / sum(n), .by = value_quintile) %>% 
+  arrange(value_quintile, donations_accurate) %>% 
+
+  gt(
+    caption = "Question: In calendar year 2023, our records indicate that you donated {currency_symbol}{reported_2023} {currency_code} to high-impact charities/funds. Is this roughly accurate? [All question respondents]",
+    groupname_col = "value_quintile",
+    rowname_col = "donations_accurate") %>% 
+  fmt_percent(pct)
+
+
+
+```
+
+For approximately 90% of respondents, their recorded donations in 2023 were accurate. The number of respondents who supplied an estimate of actual 2023 donations (or those for whom this could be imputed from their response to the donation accuracy question) was: `r nrow(filter(results,!is.na(actual_2023)))`.
+
+### Actual estimate reliability
+
+Those who reported that their recorded donations were inaccurate were asked to provide an actual estimate of their 2023 donations. 
+
+Here we review the confidence that respondents attributed to their estimates of actual donations when they reported their actual donations did not match the donations GWWC has recorded for them. `r nrow( filter(results,!is.na(donation_2023_accuracy)))` respondents provided a response to this question.
+
+> How confident are you that you donated {currency_symbol}{actual_2023} {currency_code} to high-impact charities in 2023?  
+>
+> - Very confident (within 0-5% of the actual amount)  
+> - Fairly confident (within 5-20% of the actual amount)  
+> - Not very confident (within 20-50% of the actual amount)  
+> - Unconfident (it could just as easily be double or half that amount)  
+> - Extremely unconfident (please just ignore the estimate)  
+> - I would like to update my estimate  
+> - Other  
+
+```{r}
+
+accuracy_lookup <- c("Very confident (within 0-5% of the actual amount) "=0.025,
+"Fairly confident (within 5-20% of the actual amount)"= 0.125,
+"Not very confident (within 20-50% of the actual amount)"= 0.35,
+"Unconfident (it could just as easily be double or half that amount)"= 1,
+"Extremely unconfident (please just ignore the estimate)"= 100)
+
+results %>%
+  filter(!is.na(donation_2023_accuracy)) %>% 
+  count(donation_2023_accuracy) %>% 
+  mutate(
+    donation_2023_accuracy = factor(donation_2023_accuracy, accuracy_lookup, names(accuracy_lookup)),
+    pct = n / sum(n)) %>% 
+  arrange(donation_2023_accuracy) %>% 
+
+  gt(
+    caption = "Question: How confident are you that you donated {currency_symbol}{actual_2023} {currency_code} to high-impact charities in 2023? [All question respondents]",
+    rowname_col = "donation_2023_accuracy") %>% 
+  fmt_percent(pct)
+
+
+```
+
+The broad takeaway here is that no respondent requested that their actual estimate be ignored.
+
+### Recording coefficient estimate
+
+From this we can estimate a recording coefficient for reporting pledge donors as follows. For each quintile we will: 
+
+- Estimate the average difference between recorded donations and actual donations for those who (1) reported that their recorded donations were innaccurate and (2) provided an estimate of actual donations
+- Multiply this estimate by the total number of respondents in the quintile who reported that their recorded donations were inaccurate to estimate total missing donations
+- Calculate total recorded donations by summing total recorded donations across all respondents who answered the question on donation accuracy  
+- Estimate actual donations by adding total recorded donations and estimated total missing donations
+- Divide estimated actual donations by recorded donations to arrive at a recording adjustment
+
+Finally average the recording coefficients across all quintiles to estimate the recording coefficient for the whole population.
+
+```{r}
+results %>% 
+  # Exclude those who did not answer question on donation accuracy
+   filter(!is.na(donations_accurate)) %>% 
+  mutate(
+    inaccurate_records = donations_accurate == "No, this is not accurate",
+    supplied_actual = !is.na(actual_2023) & inaccurate_records) %>% 
+  summarise(
+    number.inaccurate_supplied = sum(supplied_actual),
+    # Get average difference between recorded and actual among those with
+    # inaccurate recorded donations who provided actual
+    recorded.inaccurate_supplied = sum(reported_2023[supplied_actual]),
+    actual.inaccurate_supplied = sum(actual_2023[supplied_actual]),
+    average_diff.inaccurate_supplied = coalesce(
+      (actual.inaccurate_supplied - recorded.inaccurate_supplied) / number.inaccurate_supplied, 
+      0), # Coalesce for cases where denominator is 0
+     number.recorded_inaccurate =sum(inaccurate_records),
+    # Estimate total difference among those who recorded inaccurate donations
+    total_diff.recorded_inaccurate = average_diff.inaccurate_supplied * number.recorded_inaccurate,
+    number.all_respondents = n(),
+    recorded.all_respondents = sum(reported_2023),
+    actual.all_respondents = recorded.all_respondents + total_diff.recorded_inaccurate,
+    coefficient.all_respondents = actual.all_respondents / recorded.all_respondents,
+    .by = value_quintile
+  ) %>%
+  rename_with(str_to_sentence) %>% 
+  gt() %>% 
+  tab_spanner_delim(".",reverse =  T) %>% 
+  fmt_currency(starts_with(c("recorded","actual", "average","Total")), suffixing = T) %>% 
+  fmt_percent(starts_with("coefficient")) %>% 
+  grand_summary_rows(
+    columns = c(starts_with("coefficient")),
+    fns = list("Recording coefficient" ~ mean(.x)),
+    fmt = ~fmt_percent(.x)
+  )
+
+
+```
+
+
+
+### Conclusion: Recording coefficient
+
+- The recording coefficient for this group is 107.64%
+

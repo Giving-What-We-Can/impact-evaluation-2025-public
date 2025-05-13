@@ -1,0 +1,191 @@
+---
+title: "Clean 2023 Pledge Counterfactual Value Survey Results"
+output: html_document
+date: "`r Sys.Date()`"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r packages}
+# Load relevant packages
+pacman::p_load(tidyverse, dbplyr, gt, glue)
+```
+
+
+```{r import-raw-data}
+source("connect-parfit.R")
+
+raw_data <- tbl(con, in_schema("impact_surveys", "pcv2023_raw")) %>% 
+  # Append value quintiles and usd_normalised_donations from sample 
+  left_join(
+     tbl(con, in_schema("impact_surveys", "pcv2023_sample")),
+     by = "pledge_id"
+  ) %>% 
+  collect()
+
+```
+
+## Filter out incomplete responses
+
+First filter out survey runs, that do not constitute meaningful responses:
+
+1) That can't be linked to a respondent (because they contain no pledge_id)
+2) That don't have responses to the email question
+
+
+```{r essential-filters}
+# Get actual syrvey runs
+actual_runs <- raw_data %>% 
+  # Remove responses with no pledge id
+  filter(!is.na(pledge_id) & !is.na(amount_effect))
+
+```
+
+## Filter to include just one run from each respondent
+
+First run an automated process to figure out which runs should be kept where possible.
+
+```{r get-run-info}
+
+run_info <- actual_runs %>% 
+  mutate(
+    survey_completed = !is.na(completed),
+    survey_started = !is.na(survey_start),
+    .keep = "unused"
+  ) %>% 
+  # Create a decision variable to decide what to do with a run
+  mutate(
+    decision = case_when(
+      n() == 1 ~ "keep", # When only one run for the person keep this run
+      n_distinct(amount_effect) > 1 ~ "unclear", # When the person reports contradictory platform affects handle manually
+      sum(survey_started) > 1 ~ "unclear", # When the person started the survey more than once handle manually
+      survey_started ~ "keep", # Otherwise keep any runs where the survey was started
+      any(survey_started) ~ "discard", # If another run for the person was started, but this one wasn't then discard
+      row_number() == 1 ~ "keep", # If no runs were started, just keep the first run
+      .default = "discard" # Discard all the rest
+    ),
+    .by = pledge_id
+  )
+
+run_info %>% 
+  summarise(
+    `Total survey runs` = n(),
+    `Total respondents` = n_distinct(pledge_id),
+    `Keep` = sum(decision == "keep"),
+     `Discard` = sum(decision == "discard"),
+    `Unclear` = sum(decision == "unclear")
+    
+  ) %>% 
+  gt(caption = "Automated handling of survey runs") %>% 
+  tab_spanner("Run decision", 3:5)
+
+```
+
+Because the number of respondents is not equal to the number of runs and 15 runs have decisions that are unclear, we have to manually exclude some runs.
+
+Ambiguous runs:
+
+- Respondent has two runs. Only one was completed and was the later run, so I assume this is an updated response. Run retained: 15317321.
+- Respondent opened the survey link three times, with three different links but didn't start the survey once. All three clicks were within 8 seconds of each other and so I assume this is not a case of an updated response. I will exclude this respondent altogether.
+- Respondent has three runs, with two runs completed. I will assume the more recent completed run is their final response. Run retained: 15333947
+- Respondent has two runs. Only one was completed and was the later run, so I assume this is an updated response. Run retained: 15371661
+- Respondent has three responses. Only one answered any questions beyond the email question (i.e., there are no conflicting answers). All three have the same amount effect. I will keep the completed run. Run retained: 15295122
+- Respondent has two runs. They have different amount effects. The earlier run was completed, but the second run was not started. Because the second run was incomplete, I will discard it. This means discarding an email question response that was possibly meant to update the original response. However, because the response we will be discarding is more favourable to GWWC, this seems like the way to err conservatively. Run retained: 15294707
+
+```{r get-runs}
+cleaned_runs <- run_info %>% 
+  filter(decision == "keep" | 
+           run %in% c(
+             15317321, 
+             15333947,
+             15371661,
+             15295122,
+             15294707
+           )
+         ) %>% 
+  select(-decision)
+```
+
+We now have `r nrow(cleaned_runs)` runs from `r n_distinct(cleaned_runs$pledge_id)` respondents. This is smaller than the number of total unique respondents, because we excluded one respondent altogether
+
+## Tidy up variables
+
+A few variables need to be tidied up or appended to the results here. 
+
+
+One issue with how I coded the Guided Track is that the amount effect encoding is not consistent:
+
+```{r}
+cleaned_runs %>% 
+  arrange(amount_effect) %>% 
+  select(amount_effect_name, amount_effect) %>% 
+  unique() %>% 
+  gt()
+```
+
+Note that all the positive amount effects are different to what they should be if they are intended to be a multiplier that gives actual counterfactual donations when applied to total donations. As such, I will recode this quickly:
+
+```{r recode-amount-effect}
+
+recoded_runs <- cleaned_runs %>% 
+  mutate(amount_effect = case_match(
+    amount_effect,
+    c(0.05,0.25,0.5,0.75) ~ 1-amount_effect,
+    .default = amount_effect
+    )
+    
+  )
+
+recoded_runs %>% 
+  arrange(amount_effect) %>% 
+  select(amount_effect_name, amount_effect) %>% 
+  unique()%>% 
+  gt()
+
+```
+
+That's better.
+
+## Tag likely erroneously runs
+
+Finally, add some notes to runs that seem to have anomalous results.
+
+```{r}
+note_runs <- tribble(
+~run, ~note
+)
+
+noted_runs <- recoded_runs %>% 
+  left_join(note_runs, by = "run")
+```
+
+
+## Export
+
+The completely processed results are then written to Parfit
+
+```{r export-results}
+
+source("write_parfit.R")
+
+table_name <- "pcv2023_clean"
+
+dbWriteTable(write_con, name = Id(schema = "impact_surveys", table = table_name), 
+             value = noted_runs, 
+             row.names = FALSE, 
+             overwrite = TRUE,
+             append = FALSE)
+
+
+time_now <- Sys.time() %>% as.character()
+
+dbExecute(write_con, glue_sql(
+  "COMMENT ON TABLE impact_surveys.{`table_name`} IS 'This table contains the survey responses collected in 2025 as part of the 2023 Pledge Counterfactual Value Survey. Responses have been filtered to include one response per respondent and to include USD-normalised donations for 2023.
+                        This version was created at: {`time_now`}
+                        More information about this survey can be found in the protocol linked in the raw survey table';",
+  .con = write_con
+))
+```
+

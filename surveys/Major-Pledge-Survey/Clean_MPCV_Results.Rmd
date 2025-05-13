@@ -1,0 +1,194 @@
+---
+title: "Clean 2023 Major Pledge Counterfactual Value Survey Results"
+output: html_document
+date: "`r Sys.Date()`"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r packages}
+# Load relevant packages
+pacman::p_load(tidyverse, dbplyr, gt, glue)
+```
+
+
+```{r import-raw-data}
+source("connect-parfit.R")
+
+pledge_ids <- tbl(con, in_schema("pledges", "verified_active_pledge")) %>% 
+  select(pledge_id = id, person_id)
+
+
+raw_data <- tbl(con, in_schema("impact_surveys", "mpcv2025_raw")) %>% 
+  # Join pledge ids
+  left_join(pledge_ids, by = "person_id") %>% 
+  collect()
+
+```
+
+## Filter out incomplete responses
+
+First filter out survey runs, that do not constitute meaningful responses:
+
+1) That can't be linked to a respondent (because they contain no pledge_id)
+2) That don't have responses to the first question (and therefore no data)
+
+
+```{r essential-filters}
+# Get actual survey runs
+actual_runs <- raw_data %>% 
+  # Remove responses with no id or no response to the first question
+  filter(!is.na(person_id) & !is.na(amount_effect))
+
+```
+
+## Filter to include just one run from each respondent
+
+First run an automated process to figure out which runs should be kept where possible.
+
+```{r get-run-info}
+
+run_info <- actual_runs %>% 
+  mutate(
+    survey_completed = !is.na(completed),
+    survey_started = !is.na(survey_start),
+    .keep = "unused"
+  ) %>% 
+  # Create a decision variable to decide what to do with a run
+  mutate(
+    decision = case_when(
+      n() == 1 ~ "keep", # When only one run for the person keep this run
+      n_distinct(amount_effect) > 1 ~ "unclear", # When the person reports contradictory platform affects handle manually
+      sum(survey_started) > 1 ~ "unclear", # When the person started the survey more than once handle manually
+      survey_started ~ "keep", # Otherwise keep any runs where the survey was started
+      any(survey_started) ~ "discard", # If another run for the person was started, but this one wasn't then discard
+      row_number() == 1 ~ "keep", # If no runs were started, just keep the first run
+      .default = "discard" # Discard all the rest
+    ),
+    .by = person_id
+  )
+
+run_info %>% 
+  summarise(
+    `Total survey runs` = n(),
+    `Total completed` = sum(survey_completed),
+    `Total respondents` = n_distinct(person_id),
+    `Keep` = sum(decision == "keep"),
+     `Discard` = sum(decision == "discard"),
+    `Unclear` = sum(decision == "unclear")
+    
+  ) %>% 
+  gt(caption = "Automated handling of survey runs") %>% 
+  tab_spanner("Run decision", 4:6)
+
+```
+
+Because the number of respondents is not equal to the number of runs flagged to keep and there are two runs tagged 'unclear', we need to manually select a run.
+
+Both runs started, but only one complete: they seem to have exactly the same responses. I will keep the completed run. Run to keep: 15237009
+
+
+```{r get-runs}
+cleaned_runs <- run_info %>% 
+  filter(decision == "keep" | run == 15237009) %>% 
+  select(-decision)
+```
+
+We now have `r nrow(cleaned_runs)` runs from `r n_distinct(cleaned_runs$person_id)` respondents, as we would expect.
+
+## Correct erroneous results
+
+One respondent reported that over the course of their pledge they had donated $100M. Because this was such a substantial amount and differed by more than an order of magnitude compared to the donations we had recorded, we followed up with this donor. They reported that the amount entered was likely a mistake and they had really given around 15 M to 20M.  We will update this run with the middle of these two estimates (17.5 M) (The amount is already in USD).
+
+```{r}
+# Correct run with incorrect info
+corrected_runs <- cleaned_runs %>% 
+  mutate(
+    # Update erroneous run
+    donations_total = case_when(
+      run == 15337628 ~ 17.5e6, 
+      .default = donations_total
+      )
+  )
+```
+
+
+## Add new variables
+
+Next, I want to add some new variables to the data. Specifically, I want to add the age of the pledge at the time the survey was completed.
+
+The variables we are adding/updating are:
+
+- start_date: converting to date type
+- pledge_age: a new variable that gives age of pledge in years at the time of the survey
+- reported_total_usd, donations_total_usd, counterfactual_donations_usd: New variables that are USD-coverted versions of the base columns. 
+
+Exchange rates from mid-2023 are used, based on the fact that our sample is partially composed of our largest recording donors for 2023. This is a fairly arbitrary choice, but unlikely to have a large effect on the outcome.
+
+```{r}
+
+# Get exchange rates
+exchange_rates <- tbl(con, in_schema("public", "exchange_rate")) %>% 
+  filter(date == as.Date("2023-07-01")) %>% 
+  collect()
+
+variable_added <- corrected_runs %>% 
+  # Join mid_period exchange rates
+  left_join(exchange_rates, by = "currency_code") %>% 
+  mutate(
+    # Convert monetary vars to USD
+    across(c(reported_total, donations_total,counterfactual_donations_total),
+           ~.x  / rate, .names = "{.col}_usd"),
+    # Convert start date to date object
+    start_date = mdy(start_date), 
+    # Get pledge age in years
+    pledge_age = interval(start_date, time_started) / years(1)
+    )
+```
+
+
+## Tag anomalous runs
+
+Finally, append some notes to runs that we want to flag in our database.
+
+```{r note-runs}
+note_runs <- tribble(
+~run, ~note,
+15337628, "This run has had donations_total updated to reflect a correction",
+99991, "This response was added manually as the respondent reported their answer by email rather than by following the survey link. This respondent reported GWWC had no effect on the amount they donated to high-impact charities."
+)
+
+noted_runs <- variable_added %>% 
+  left_join(note_runs, by = "run")
+```
+
+
+## Export
+
+The completely processed results are then written to Parfit
+
+```{r export-results}
+
+source("write_parfit.R")
+
+table_name <- "mpcv2025_clean"
+
+dbWriteTable(write_con, name = Id(schema = "impact_surveys", table = table_name), 
+             value = noted_runs, 
+             row.names = FALSE, 
+             overwrite = TRUE,
+             append = FALSE)
+
+
+time_now <- Sys.time() %>% as.character()
+
+dbExecute(write_con, glue_sql(
+  "COMMENT ON TABLE impact_surveys.{`table_name`} IS 'This table contains the survey responses collected in 2025 as part of the 2025 Major Pledge Counterfactual Value Survey. Responses have been filtered to include one response per respondent.
+                        This version was created at: {`time_now`}
+                        More information about this survey can be found in the protocol linked in the raw survey table';",
+  .con = write_con
+))
+```
+

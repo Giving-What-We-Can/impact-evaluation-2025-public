@@ -1,0 +1,157 @@
+---
+title: "Recurring reported donation check"
+output: html_document
+date: "`r Sys.Date()`"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Document purpose
+
+Quick script to check whether there is an obvious non-response bias against pledgers whose only donations are recurring recorded donations. Specifically, I will look at response rates for the Pledge 2023 Recording Accuracy Survey among those with recorded donations in 2023, and compare the proportion of total respondents to the proportion of respondents whose only recorded donations for 2023 were recurring reported donations
+
+# Setup
+
+Let's load our packages. I'll just load the standard ones, I might not use all of these:
+
+```{r load-packages}
+pacman::p_load(tidyverse, gt, PHEindicatormethods, dbplyr)
+```
+
+Connect to parfit:
+
+```{r connect-to-parfit}
+source("connect-parfit.R")
+```
+
+Establish helper functions to:
+
+1. Bin recorded 2023 donations
+2. Convert snake case variable names to readable table column names
+
+```{r establish-helper-functions}
+# Function for binning reported donations
+slice_em <- function(x) cut(x, c(-Inf, 0,5000,25000,Inf),
+                            c("None", "$5K or less",
+                              "$5K to $25K",">$25K"))
+
+# Function for making pretty column names
+variable_to_name <- function(x) str_to_sentence(str_replace_all(x,"_"," "))
+```
+
+# Import data
+
+First, a query for importing 2023 pledge donations by pledge donor. I will import both the total usd-normalised 2023 donations and whether ALL of the pledgers donations for the year were of the type recurring reported:
+
+```{r get-2023-recorded-donations}
+# Get recorded donations by pledger for 2023 and whether the donations were all recurring reported
+pledge_amount_2023_query <- tbl(con, dbplyr::in_schema("reporting", "complete_giving_report")) %>% 
+  mutate(donation_year = year(donation_date)) %>% 
+  filter(
+    !is.na(pledge_id), #Just pledge donations
+    
+    donation_year == 2023 # Just from 2023
+  ) %>% 
+  summarise( 
+    reported_2023_usd = sum(amount_normalized, na.rm= T), # Get 2023 donations by pledge id
+    all_reported_recurring = all(object_type == "reported_donation" & recurrence == "recurring", na.rm=T),
+    any_payments = any(object_type == "payment",na.rm = T),
+    .by = pledge_id
+  ) %>% 
+  collect() %>% 
+  mutate(pledge_id = as.double(pledge_id))
+```
+
+Next let's load in the survey results. I will import the respondents so we can use them for response rates. I will use the sample as the analysis dataset, because it includes respondents and non-respondents (and hence can be used for response rates).
+
+```{r import-respondents-and-sample}
+# Import respondents to join to sample
+prac_respondents <- tbl(con, in_schema("impact_surveys", "prac2023_clean")) %>% 
+  select(pledge_id, donations_2023, reported_2023) %>% 
+  collect() %>% 
+  mutate(responded = TRUE)
+
+# Import sample, join respondents and join 2023 recorded donation info
+prac_sample <- tbl(con, in_schema("impact_surveys", "prac2023_sample")) %>% 
+  collect() %>% 
+  left_join(prac_respondents, by = "pledge_id") %>% 
+  left_join(pledge_amount_2023_query, by = "pledge_id") %>% 
+  # Tidy up some missing values from columns added during joins
+  mutate(responded = coalesce(responded, FALSE),
+         reported_2023_usd = coalesce(reported_2023_usd, 0),
+         # Also bin donations for analysis
+         binned_recorded_2023 = slice_em(reported_2023_usd))
+```
+
+# Results
+
+## Recurring reported donations
+
+Now let's compare response rates by group for all pledgers and pledgers with only recurring reported donations for 2023:
+
+```{r summarise-results}
+# Summarise results by recorded donation bucket
+prac_sample %>% 
+  filter(reported_2023_usd > 0) %>% 
+  summarise(
+    num_sampled = n(),
+    num_responded = sum(responded),
+    num_sampled_recurring_reported = sum(all_reported_recurring),
+    num_responded_recurring_reported = sum(responded & all_reported_recurring),
+    .by = binned_recorded_2023) %>% 
+  bind_rows(summarise(., across(where(is.numeric), sum))) %>% 
+  mutate(
+    percent_sampled_recurring_reported = num_sampled_recurring_reported/num_sampled,
+    percent_responded_recurring_reported = num_responded_recurring_reported / num_responded,
+    
+    response_rate_overall = num_responded/ num_sampled,
+    response_rate_recurring_reporting = num_responded_recurring_reported / num_sampled_recurring_reported,
+    binned_recorded_2023 = fct_na_value_to_level(binned_recorded_2023, "All")
+    ) %>% 
+  arrange(binned_recorded_2023) %>% 
+  gt(caption = "Response to the Pledge 2023 Recording Accuracy Survey among pledgers with only recurring reported donations in 2023") %>% 
+  cols_label_with(fn = variable_to_name) %>% 
+  fmt_percent(c(starts_with("percent"), starts_with("response_rate")))
+
+```
+
+In general, the response rates are notably lower for the recurring reported donors and this is predominantly driven by the group with between $5K and 25K in reported donations. There is more likely than not some non-response bias going on here, but it's impact on the overall result is unlikely to be much more than ~10% (Note that the difference between the percent of the overall sample from this group and the percent of respondents from this group is close to 10%, so, even if the non-response bias is caused entirely by those who donated nothing then overall donations should only decrease about 10% if they were properly represented). 
+
+
+## Payments
+
+As an afterthought, I wanted to check how response characteristics differed among those who recorded any payments in 2023. We know that payment reflect donations that really occurred and so understanding whether those who made donations we can verify varied in their responses from those who made donations we can't easily verify, might tell us something about non-response bias:
+
+```{r}
+# Summarise results by recorded donation bucket
+prac_sample %>% 
+  filter(reported_2023_usd > 0) %>% 
+  summarise(
+    num_sampled = n(),
+    num_responded = sum(responded),
+    num_sampled_payment = sum(any_payments),
+    num_responded_payment = sum(responded & any_payments),
+    .by = binned_recorded_2023) %>% 
+  bind_rows(summarise(., across(where(is.numeric), sum))) %>% 
+  mutate(
+    percent_sampled_recurring_reported = num_sampled_payment/num_sampled,
+    percent_responded_recurring_reported = num_responded_payment / num_responded,
+    
+    response_rate_overall = num_responded/ num_sampled,
+    response_rate_payment = num_responded_payment / num_sampled_payment,
+    binned_recorded_2023 = fct_na_value_to_level(binned_recorded_2023, "All")
+    ) %>% 
+  arrange(binned_recorded_2023) %>% 
+  gt(caption = "Response to the Pledge 2023 Recording Accuracy Survey among pledgers with any payments in 2023") %>% 
+  cols_label_with(fn = variable_to_name) %>% 
+  fmt_percent(c(starts_with("percent"), starts_with("response_rate")))
+
+
+```
+
+
+In general, response rates were very similar among those who made a payment through the GWWC platform in 2023 and those who did not. Once again, we observed a different result among the larger donors compared to the smaller donors. The smaller donors did see a slightly elevated response rate among those who made a payment via GWWC in 2023, but this difference was not very large. This result further reduces my concerns about the possible extent of the impact of non-response bias on our results for pledgers who record donations.
+
+

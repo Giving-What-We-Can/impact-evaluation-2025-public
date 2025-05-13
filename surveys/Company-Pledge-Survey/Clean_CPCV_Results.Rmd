@@ -1,0 +1,139 @@
+---
+title: "Clean 2023 Company Pledge Counterfactual Value Survey Results"
+output: html_document
+date: "`r Sys.Date()`"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r packages}
+# Load relevant packages
+pacman::p_load(tidyverse, dbplyr, gt, glue)
+```
+
+
+```{r import-raw-data}
+source("connect-parfit.R")
+
+# Get exchange rates
+exchange_rates <- tbl(con, in_schema("public", "exchange_rate")) %>% 
+   filter(date == as.Date("2022-07-01"))
+
+raw_data <- tbl(con, in_schema("impact_surveys", "cpcv2025_raw")) %>% 
+  # Join midyear exchanged rates
+  left_join(exchange_rates, by = "currency_code") %>% 
+  # Add normalised monetary units
+  mutate(
+    across(c(donations_total,counterfactual_donations_total,total_profit),
+           ~.x  / rate, .names = "{.col}_usd")
+  ) %>% 
+  collect()
+
+```
+
+## Filter out incomplete responses
+
+First filter out survey runs, that do not constitute meaningful responses:
+
+1) That can't be linked to a respondent (because they contain no pledge_id)
+2) That don't have responses to the first question (and therefore no data)
+
+
+```{r essential-filters}
+# Get actual survey runs
+actual_runs <- raw_data %>% 
+  # Remove responses with no id or no response to the first question
+  filter(!is.na(id) & !is.na(donations_total))
+
+```
+
+## Filter to include just one run from each respondent
+
+First run an automated process to figure out which runs should be kept where possible.
+
+```{r get-run-info}
+
+run_info <- actual_runs %>% 
+  mutate(
+    survey_completed = !is.na(completed),
+    .keep = "unused"
+  ) %>% 
+  # Create a decision variable to decide what to do with a run
+  mutate(
+    decision = case_when(
+      n() == 1 ~ "keep", # When only one run for the person keep this run
+      n() > 1 ~ "unclear", # When the person started the survey more than once handle manually
+      .default = "discard" # Discard all the rest
+    ),
+    .by = id
+  )
+
+run_info %>% 
+  summarise(
+    `Total survey runs` = n(),
+    `Total completed` = sum(survey_completed),
+    `Total respondents` = n_distinct(id),
+    `Keep` = sum(decision == "keep"),
+     `Discard` = sum(decision == "discard"),
+    `Unclear` = sum(decision == "unclear")
+    
+  ) %>% 
+  gt(caption = "Automated handling of survey runs") %>% 
+  tab_spanner("Run decision", 4:6)
+
+```
+
+Because the number of respondents is equal to the number of runs flagged to keep, we don't need to do any manual sorting of runs.
+
+```{r get-runs}
+cleaned_runs <- run_info %>% 
+  filter(decision == "keep") %>% 
+  select(-decision)
+```
+
+We now have `r nrow(cleaned_runs)` runs from `r n_distinct(cleaned_runs$id)` respondents, as we would expect.
+
+
+## Tag likely erroneously runs
+
+Finally, add some notes to runs that seem to have anomalous results.
+
+```{r}
+note_runs <- tribble(
+~run, ~note
+)
+
+noted_runs <- cleaned_runs %>% 
+  left_join(note_runs, by = "run")
+```
+
+
+## Export
+
+The completely processed results are then written to Parfit
+
+```{r export-results}
+
+source("write_parfit.R")
+
+table_name <- "cpcv2025_clean"
+
+dbWriteTable(write_con, name = Id(schema = "impact_surveys", table = table_name), 
+             value = noted_runs, 
+             row.names = FALSE, 
+             overwrite = TRUE,
+             append = FALSE)
+
+
+time_now <- Sys.time() %>% as.character()
+
+dbExecute(write_con, glue_sql(
+  "COMMENT ON TABLE impact_surveys.{`table_name`} IS 'This table contains the survey responses collected in 2025 as part of the 2025 Company Pledge Counterfactual Value Survey. Responses have been filtered to include one response per respondent.
+                        This version was created at: {`time_now`}
+                        More information about this survey can be found in the protocol linked in the raw survey table';",
+  .con = write_con
+))
+```
+

@@ -1,0 +1,471 @@
+---
+title: "Analysis of 2024 Non-Pledge Counterfactual Value Survey Results"
+output: html_document
+date: "`r Sys.Date()`"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r packages}
+# Load relevant packages
+pacman::p_load(tidyverse, dbplyr, gt, PHEindicatormethods, jsonlite)
+```
+
+
+```{r import-processed-data}
+# Import processed results
+source("connect-parfit.R")
+
+sample_tbl <-  tbl(con, in_schema("impact_surveys", "npcv2024_sample")) 
+
+results <- tbl(con, in_schema("impact_surveys", "npcv2024_clean")) %>% 
+  left_join(select(sample_tbl,person_id,value_quintile), by = "person_id") %>% 
+  # Exclude major non-pledge donors
+  filter(!is.na(value_quintile)) %>% 
+  collect() 
+```
+
+```{r import-sample}
+# Import sample
+
+sample <- sample_tbl %>% 
+  collect() %>% 
+  mutate(responded = person_id %in% results$person_id,
+         completed = person_id %in% results$person_id[results$survey_complete])
+```
+
+
+## Document purpose
+
+Here I will conduct quantitative analysis of the results of the 2024 Non-Pledger Counterfactual Value Survey, which was run as part of Giving What We Can's internal impact evaluaton for the 2023--2024 period. The primary purpose of this analysis is to estimate a counterfactuality coefficient for this group.
+
+## Survey response rates and representativeness
+
+### Response rates
+
+This survey included a sample of up to 150 non-pledge donors from each of the following groups (when ordered by total 2024 donations via the GWWC platform):
+
+1) Those contributing to the first quintile of recorded 2024 non-pledge donations
+2) Those contributing to the second quintile of recorded 2024 non-pledge donations
+3) Those contributing to the third quintile of recorded 2024 non-pledge donations
+4) Those contributing to the fourth quintile of recorded 2024 non-pledge donations
+5) Those contributing to the fifth quintile of recorded 2024 non-pledge donations
+
+Excluding the top 10 non-pledge donors for 2024.
+
+We will analyse response rates first by these 'value quintiles':
+
+```{r response-rates}
+get_response_rates <- function(x, by_col) {
+  x %>% 
+    summarise(
+    sampled = n(),
+    responded = sum(responded),
+    completed = sum(completed),
+     .by = {{by_col}}) %>% 
+  phe_proportion(responded, sampled, "standard") %>% 
+  rename_with(~str_c("response_",.x),.cols = c(value,uppercl,lowercl)) %>% 
+  phe_proportion(completed, sampled, "standard") %>% 
+  rename_with(~str_c("complete_",.x),.cols = c(value,uppercl,lowercl)) %>% 
+  arrange({{by_col}}) 
+}
+
+make_response_rates_table <- function(x) {
+  x %>% 
+  gt() %>% 
+  fmt_percent(
+    c(starts_with("response_"), starts_with("complete_")),
+    decimals = 0) %>% 
+  cols_merge(starts_with("response_"),pattern = "{1}&nbsp;({2}&#8288;–&#8288;{3})")%>% 
+  cols_merge(starts_with("complete_"),pattern = "{1}&nbsp;({2}&#8288;–&#8288;{3})") %>% 
+  cols_label(
+    sampled ~ "Number sampled",
+    responded ~ "Number responded",
+    completed ~ "Number completed",
+    response_value ~ html("Response&nbsp;rate"),
+    complete_value ~ html("Completion&nbsp;rate")
+  )
+}
+
+
+response_rates <- sample %>%
+  get_response_rates(value_quintile) 
+
+response_rates %>% 
+  bind_rows(get_response_rates(sample)) %>% 
+  mutate(value_quintile = coalesce(as.character(value_quintile), "Total")) %>% 
+  rename(`Value quintile` = value_quintile) %>%
+  make_response_rates_table()
+  
+```
+
+As we can see, response rates were fairly consistently around 30% for the larger donors, but were lower among the lowest (5th) value quintile donors.
+
+### Sample representativeness
+
+One thing we want to ascertain is how representative of the entire sample, the respondents really are. As a first step here, we consider how the amount respondents report donating compares to the amount the sample as a whole reports donating.
+
+```{r representativeness-by-sample-type}
+# Create function for summarising the donations of a population
+donations_summary <- function(df,group_col) {
+  df %>% 
+    summarise(
+      n = n(),
+      `Reported Donations_Mean` = mean(usd_normalised_donations),
+      `Reported Donations_SD` = sd(usd_normalised_donations),
+      Percentile_75           = quantile(usd_normalised_donations, 0.75),
+      Percentile_90          = quantile(usd_normalised_donations, 0.9),
+      Percentile_95     = quantile(usd_normalised_donations, 0.95),
+      .by = {{group_col}}
+    )
+}
+
+bind_rows(
+  list(
+    Sample = donations_summary(sample,value_quintile),
+    Respondents = donations_summary(filter(sample, responded),value_quintile),
+    Completed = donations_summary(filter(sample, completed),value_quintile)
+    ),
+  
+  .id = "Group"
+) %>% 
+  # Get results across all quintiles
+  bind_rows(
+    bind_rows(
+      list(
+        Sample = donations_summary(sample) %>% mutate(value_quintile = 99),
+        Respondents = donations_summary(filter(sample, responded))%>% mutate(value_quintile = 99),
+        Completed = donations_summary(filter(sample, completed))%>% mutate(value_quintile = 99)
+        ),
+  
+  .id = "Group"
+    )
+) %>% 
+  arrange(value_quintile,Group) %>% 
+  mutate(value_quintile = factor(
+    value_quintile, 
+    c(1:5, 99),
+    c(str_c("Quintile ", 1:5), "All Respondents")
+    )) %>% 
+  gt(groupname_col = "value_quintile") %>% 
+  tab_spanner_delim("_") %>% 
+  fmt_currency(suffixing = T) %>% 
+  fmt_number(n, decimals = 0) 
+```
+
+In terms of recorded donations, the respondents are fairly representative of the sample as a whole, even in the 5th value quintile in which lower response rates were observed.
+
+## Results
+
+### Counterfactuality adjustment
+
+#### Background
+
+The question posed in the email sent to non-pledge donors for this survey was:
+
+> Which of the following best describes your likely donation behaviour in calendar year 2024 if you had never encountered Giving What We Can? 
+Please click one of the options below:
+
+> - I would likely have donated less to highly effective charities and/or funds
+> - I would likely have donated roughly the same amount or more to highly effective charities and/or funds
+
+
+```{r counterfactual-binary-results}
+
+results %>% 
+  janitor::tabyl(value_quintile, platform_affect) %>% 
+  bind_rows(summarise(., across(where(is.numeric), sum), 
+                      value_quintile = 99)) %>% 
+  mutate(`Percent reporting GWWC increased their effective donations` = Yes / rowSums(across(c("Yes","No"))),
+         value_quintile = factor(
+            value_quintile, 
+            c(1:5, 99),
+            c(str_c("Quintile ", 1:5), "All Respondents")
+            )
+    )%>%  
+  gt(
+    caption = "Question: Which of the following best describes your likely donation behaviour in calendar year 2024 if you had never encountered Giving What We Can?",
+    rowname_col = "value_quintile") %>% 
+  fmt_percent(`Percent reporting GWWC increased their effective donations`) %>% 
+  tab_spanner("Reported GWWC increased their effective 2024 donations", 2:3) %>% 
+  tab_footnote(
+    'Responded: "I would likely have donated less to highly effective charities and/or funds"',
+    locations = cells_column_labels("Yes")
+    ) %>% 
+  tab_footnote(
+    'Responded: " I would likely have donated roughly the same amount or more to highly effective charities and/or funds"',
+    locations = cells_column_labels("No")
+    )
+
+```
+
+Overall, a majority of respondents reported that GWWC increased the amount they donations to highly effective charities. However, this varied by quintile, with fewer donors in the largest two quintiles reporting an effect.
+
+##### Reported-donations-weighted estimate
+
+Our method for estimating the counterfactual coefficient will consist of estimating a counterfactual adjustment for each value quintile and averaging these to come up with the overall counterfactual coefficient for this group (2024 non-pledge donors excluding the top 10 non-pledge donors for that year). Because not all respondents who reported GWWC affected their giving provided a counterfactual estimate, we will need to impute this value for some respondents.
+
+Overall, `r nrow(filter(results,!is.na(nonpledge_counterfactual_2024) | platform_affect == "No"))` respondents provided an estimate of GWWC's counterfactual influence on their donations or confirmed that GWWC had no effect on their donations.
+
+The method we used for estimating the counterfactual coefficient for each value quintile can be explained as follows:
+
+- Estimate the counterfactual percentage among those who reported GWWC affected their giving and provided a counterfactual estimate. This is estimated by summing each of total 2024 donations and counterfactual 2024 donations across the quintile and then dividing the counterfactual 2024 donations by the total 2024 donations.
+- Apply this adjustment to the sum total of 2024 donations of all donors in the quintile who reported GWWC affected the amount they donated (including those who did not provide a specific estimate) in order to estimate total counterfactual 2024 donations across all respondents
+- Divide this estimate of total counterfactual 2024 donations by total 2024 donations across respondents to arrive at a counterfactuality coefficient for the sample
+- Estimate the coefficient for the whole population (including non-respondents) by assuming a constant discount in the coefficient for non-respondents.
+
+First, we perform the first few steps to estimate the counterfactuality coefficient among respondents in each quintile.
+
+```{r counterfactual-coefficient-results}
+overall_counterfactual_stats <- results %>% 
+  summarise(
+    all_respondents.number = n(),
+    all_respondents.2024_donations = sum(donation_2024_usd),
+    .by = value_quintile
+  )
+
+
+counterfactuals_by_quintile <- function(x) {
+  
+  x %>% 
+    # Get those who reported GWWC increased their giving 
+    filter(platform_affect == "Yes") %>% 
+    # Tag those who provided an estimate of counterfactual donations
+    mutate(provided_counterfactual = !is.na(counterfactual_2024_usd)) %>% 
+    summarise(
+      
+      provided_counterfactual.number = sum(provided_counterfactual),
+      # Get total and counterfactual donations of those who provided counterfactual estimate
+      provided_counterfactual.2024_donations = sum(donation_2024_usd[provided_counterfactual]),
+      provided_counterfactual.2024_counterfactual_donations = 
+        sum(counterfactual_2024_usd[provided_counterfactual]),
+      # Use this to estimate counterfactual percentage for the platform_affect group
+      provided_counterfactual.counterfactual_percentage = provided_counterfactual.2024_counterfactual_donations/provided_counterfactual.2024_donations,
+       respondents_affected.number = n(),
+      # Get total donations for the platform affect group
+       respondents_affected.2024_donations = sum(donation_2024_usd),
+      # Multiply by the counterfactual percentage to get estimated counterfactual donations
+      respondents_affected.2024_implied_counterfactual_donations = respondents_affected.2024_donations * provided_counterfactual.counterfactual_percentage,
+      .by = value_quintile
+    ) %>% 
+    # Join total donations across affected and unaffected
+    left_join(overall_counterfactual_stats, by = "value_quintile") %>% 
+    mutate(
+      # Divided estimated counterfactual donations by total donations
+      all_respondents.2024_implied_counterfactual_coefficient = 
+        respondents_affected.2024_implied_counterfactual_donations /
+        all_respondents.2024_donations
+      )
+
+}
+
+label_columns <- function(x) str_to_sentence(str_replace_all(x,"_"," "))
+
+counterfactual_estimates_raw <- counterfactuals_by_quintile(results)
+
+counterfactual_estimates_raw %>% 
+  rename_with(label_columns) %>% 
+  gt(caption = "Table for estimating the proportion of total 2024 donations from respondents that occurred counterfactually because of GWWC") %>% 
+  tab_spanner_delim(".") %>% 
+  fmt_currency(contains("donations"), suffixing = T) %>% 
+  fmt_percent(ends_with(c("percentage","coefficient")))
+
+```
+
+
+What is unusual about this result, is that the 4th value quintile has a counterfactuality coefficient of above 100%, implying that Giving What We Can has, on average, caused these donors to give more money to highly effective charities than these donors donate through the Giving What We Can Platform. This is a plausible result: it may well be that Giving What We Can has motivated some non-pledgers to engage with effective giving, causing them to donate to effective opportunities in ways other than through the GWWC platform. In this case, analysis of the individual results shows this result seems to be mostly driven by one respondent who donated $2K via the GWWC platform in 2024, but reported donating \$30K counterfactually. Although this is plausible, because this is a somewhat surprising result, below I will recalculate these results, capping each respondent's counterfactual donations at the level of their GWWC recorded donations.
+
+```{r counterfactual-coefficient-results-capped}
+counterfactual_estimates_capped <- results %>% 
+  mutate(
+    # Cap counterfactual donations at total donations
+    counterfactual_2024_usd = if_else(
+      counterfactual_2024_usd > donation_2024_usd, 
+      donation_2024_usd, 
+      counterfactual_2024_usd)
+    ) %>% 
+  # Get counterfactuals by quintile
+  counterfactuals_by_quintile()
+
+# Tabulate results
+counterfactual_estimates_capped %>% 
+  rename_with(label_columns) %>% 
+  gt(
+    caption = "Table for estimating the proportion of total 2024 donations from respondents that occurred counterfactually because of GWWC, capping each respondent's counterfactual donations to total donations recorded by GWWC"
+  ) %>% 
+  tab_spanner_delim(".") %>% 
+  fmt_currency(contains("donations"), suffixing = T) %>% 
+  fmt_percent(ends_with(c("percentage","coefficient")))
+```
+
+Here we see similar implied counterfactuality coefficients among respondents for all of the lower 3 quintiles and lower coefficients in the upper two quintiles.
+
+Now we want to estimate our coefficients from these surveys by applying discounts to implied coefficient among respondents in order to account for non-response bias?
+
+```{r get-coefficient-estimates}
+calc_coefficient <- function(x) {
+x %>% 
+    left_join(response_rates, by = "value_quintile") %>% 
+    mutate(
+      counterfactual_coefficient.non_response_discount_50 = 
+        response_value * all_respondents.2024_implied_counterfactual_coefficient
+        +
+        (1-response_value) * all_respondents.2024_implied_counterfactual_coefficient*0.5,
+      counterfactual_coefficient.non_response_discount_75 = 
+        response_value * all_respondents.2024_implied_counterfactual_coefficient
+        +
+        (1-response_value) * all_respondents.2024_implied_counterfactual_coefficient*0.25
+    ) %>% 
+  select(
+    value_quintile,
+    response_rate = response_value,
+    counterfactual_coefficient.no_discount = all_respondents.2024_implied_counterfactual_coefficient,
+    counterfactual_coefficient.non_response_discount_50,
+    counterfactual_coefficient.non_response_discount_75
+  ) %>%
+  rename_with(label_columns) %>% 
+  gt() %>% 
+  tab_spanner_delim(".") %>% 
+  fmt_percent(-`Value quintile`) %>% 
+  grand_summary_rows(
+    columns = starts_with("Counterfactual"),
+    fns = list("Counterfactual coefficient" ~ mean(.x)),
+    fmt = ~fmt_percent(.x)
+    )
+    }
+
+calc_coefficient(counterfactual_estimates_raw) %>% 
+  tab_caption("Counterfactuality coeffients with unmodified 2024 counterfactual donations")
+  
+
+
+calc_coefficient(counterfactual_estimates_capped) %>% 
+  tab_caption("Counterfactuality coeffients with 2024 counterfactual donations capped at 2024 donations")
+  
+
+
+```
+
+We will use the capped coefficient for the conservative estimate and the uncapped coefficient for the conservative estimate. One reason for erring with the capped coefficient in the conservative case is that the donors who report GWWC affected more donations than are recorded on their account could have multiple accounts with which they donate to Giving What We Can, meaning capping donations prevents double counting.
+
+Overall, this implies our counterfactual coefficients for non-pledge donations should be:
+
+- Best guess estimate: 27.12%  
+- Conservative estimate: 14.86%
+
+### Other counterfactuality results
+
+In addition to these headline results, we are also interested in finding out more about how GWWC counterfactually influenced our non-pledge donors.
+
+#### Counterfactual activities
+
+First, what GWWC activities did respondents report influenced the amount they donated to high-impact charities and funds in 2024. This question was asked of respondents who reported that GWWC caused them to give more than they otherwise would have:
+
+```{r counterfactual-activities}
+default_options <- c("The 🔸10% Pledge or 🔹Trial Pledge", "Our giving recommendations","Our donation platform allowing you to donate to a wide range of charities","Our donation platform allowing you to donate tax-deductibly.","Our research content (e.g., our cause pages, charity pages, why we recommend funds, etc.)","Our events (e.g. Effective Giving Day)","Members of the Giving What We Can community","Members of our team", "Other")
+
+# Get results for those who responded to this question
+responded_to_activities <- results %>% 
+   filter(!is.na(nonpledge_counterfactual_activities))
+
+responded_to_activities %>% 
+  # reframe from JSON to list all activities
+  reframe(activities = lapply(nonpledge_counterfactual_activities, function(s) {
+    if (is.na(s)) return(NA)
+    fromJSON(s)
+    }) %>% unlist
+) %>% 
+  mutate(activities = factor(activities, default_options)) %>% 
+  summarise(
+    Respondents.Number = n(),
+    Respondents.Percent = n()/nrow(responded_to_activities),
+    .by = activities) %>% 
+  gt(
+    caption = sprintf("Question: What part(s) of Giving What We Can have affected how much you donated to highly effective charities or funds in 2024? (Respondents: n = %i)",nrow(responded_to_activities)),
+    rowname_col = "activities"
+    ) %>% 
+  tab_spanner_delim(".") %>% 
+  fmt_percent(ends_with("Percent"))
+```
+
+#### First effective donation
+
+We also asked respondents whether GWWC affected the first donation they made to highly effective charities or funds
+
+```{r first-donation-affected}
+responded_to_first_donation <- results %>% 
+  filter(!is.na(nonpledge_first_donation))  
+  
+responded_to_first_donation %>% 
+  bind_rows(mutate(responded_to_first_donation, platform_affect = "Total")) %>% 
+  summarise(
+     Respondents.Number = n(),
+    .by = c(nonpledge_first_donation, platform_affect)
+    ) %>% 
+  mutate(Respondents.Percent = Respondents.Number/sum(Respondents.Number),
+         platform_affect = case_match(
+           platform_affect,
+           "Yes" ~ "Giving What We Can affected amount donated in 2024",
+           "No" ~ "Giving What We Can did not affect amount donated in 2024",
+           "Total" ~ "All respondents"
+           ),
+         .by = platform_affect) %>% 
+  arrange(platform_affect, nonpledge_first_donation) %>% 
+  gt(
+    caption = sprintf(
+      "Did Giving What We Can or its platform (including when it was still the EA Funds platform) affect you making your first donation to highly effective charities or funds? (Respondents: n = %i)",
+      nrow(responded_to_first_donation)),
+    rowname_col = "nonpledge_first_donation",
+    groupname_col = "platform_affect"
+    ) %>% 
+  tab_spanner_delim(".") %>% 
+  fmt_percent(ends_with("Percent"))
+
+
+```
+
+
+Overall, over 80% of respondents reported that GWWC affected their first donation to a highly effective charity/fund, including over 40% of those who reported that GWWC did not affect the amount they donated to highly effective charities in 2024. This result is plausible, but it could imply that GWWC had more of a counterfactual influence on these donors than our coefficient implies.
+
+#### Affects charity choice
+
+We also asked donors whether GWWC affected which charities they donated to.
+
+```{r charity-choice-affected}
+responded_to_charity_choice <- results %>% 
+  filter(!is.na(affected_charity_choice))  
+  
+responded_to_charity_choice %>% 
+  bind_rows(mutate(responded_to_charity_choice, platform_affect = "Total")) %>% 
+  summarise(
+     Respondents.Number = n(),
+    .by = c(affected_charity_choice, platform_affect)
+    ) %>% 
+  mutate(Respondents.Percent = Respondents.Number/sum(Respondents.Number),
+         platform_affect = case_match(
+           platform_affect,
+           "Yes" ~ "Giving What We Can affected amount donated in 2024",
+           "No" ~ "Giving What We Can did not affect amount donated in 2024",
+           "Total" ~ "All respondents"
+           ),
+         .by = platform_affect) %>% 
+  arrange(platform_affect, affected_charity_choice) %>% 
+  gt(
+    caption = sprintf(
+      "Has Giving What We Can or its donation platform affected which charities or funds you donate to?
+ (Respondents: n = %i)",
+      nrow(responded_to_first_donation)),
+    rowname_col = "affected_charity_choice",
+    groupname_col = "platform_affect"
+    ) %>% 
+  tab_spanner_delim(".") %>% 
+  fmt_percent(ends_with("Percent"))
+
+
+```
+
+Overall, 86% of respondents reported that GWWC affected which charities they donate to, including 76% of respondents who reported GWWC did not affect the amount they donated to highly effective charities/funds in 2024. Again, this result implies that just modelling our counterfactual coefficient on the amount we affected rather than our influence on which charities/funds donors give to may understate our counterfactual impact. 
+
+

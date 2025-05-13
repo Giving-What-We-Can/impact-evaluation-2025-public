@@ -1,0 +1,48 @@
+---
+title: "Non-response bias"
+output: html_document
+date: "`r Sys.Date()`"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+
+
+```{r load-packaages}
+pacman::p_load(binom, tidyverse, gt)
+
+```
+
+The purposes of this document is to run some very quick statistical tests comparing the results of the non-response followup survey to those of the original Pledge 2023 Recording Accuracy survey.
+
+First, did respondents to the non-response followup survey differ significantly from respondents to the original survey in their likelihood of having accurate pledge donations? Lets run a fisher test:
+
+```{r fisher-test-results}
+# Create the table
+survey_data <- tribble(
+ ~accurate_records, ~inaccurate_records,
+  20, 28, # Original survey
+  6 , 0   # Non-response followup
+)
+
+# Run Fisher's exact test
+fisher.test(survey_data)
+```
+Next, what are the confidence intervals on the proportion of the sample whose recorded donations were accurate? 
+
+```{r }
+bind_rows(
+  list(
+  # Group 1: 20 out of 48
+  Original = binom.confint(x = 20, n = 48, methods = "exact", conf.level = 0.95),
+  # Group 2: 6 out of 6
+  `Non-response` = binom.confint(x = 6, n = 6, methods = "exact", conf.level = 0.95)
+  ), .id = "Sample"
+) %>%
+  select(-method) %>% 
+  gt() %>% 
+  fmt_percent(4:6)
+```

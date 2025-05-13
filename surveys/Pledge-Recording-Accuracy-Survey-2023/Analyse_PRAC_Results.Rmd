@@ -1,0 +1,910 @@
+---
+title: "Analysis of 2023 Pledger Reporting Accuracy and Counterfactuality Survey Results"
+output: html_document
+date: "`r Sys.Date()`"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r packages}
+# Load relevant packages
+pacman::p_load(tidyverse, dbplyr, gt, PHEindicatormethods, janitor)
+```
+
+
+```{r import-processed-data}
+# Import processed results
+source("connect-parfit.R")
+
+results <- tbl(con, in_schema("impact_surveys", "prac2023_clean")) %>% 
+  collect()
+```
+
+```{r import-sample}
+# Import sample
+
+sample <- tbl(con, in_schema("impact_surveys", "prac2023_sample")) %>% 
+  collect() %>% 
+  mutate(
+    responded = pledge_id %in% results$pledge_id,
+    completed = pledge_id %in% results$pledge_id[results$survey_complete],
+    sample_type = factor(
+      sample_type,
+      c("base","large_donor_booster"),
+      c("Random","Major donor booster"))
+    )
+```
+
+
+## Document purpose
+
+Here I will conduct quantitative analysis of the results of the 2023 Pledger Reporting Accuracy and Counterfactuality Survey, which was run as part of Giving What We Can's internal impact evaluaton for the 2023--2024 period. The primary prupose of this survey is to generate recording and counterfactual coefficients for general pledge donors.
+
+## Survey response rates and representativeness
+
+### Response rates
+
+This survey included two samples:
+
+1) A fully random sample across all pledgers (n = 750)  
+2) A booster sample of pledgers who have reported donating more than $25K USD in 2023 (n = 75)
+
+First, we will analyse response rates first by sample type:
+
+```{r}
+get_response_rates <- function(x, by_col) {
+  x %>% 
+    summarise(
+    sampled = n(),
+    responded = sum(responded),
+    completed = sum(completed),
+     .by = {{by_col}}) %>% 
+  phe_proportion(responded, sampled, "standard") %>% 
+  rename_with(~str_c("response_",.x),.cols = c(value,uppercl,lowercl)) %>% 
+  phe_proportion(completed, sampled, "standard") %>% 
+  rename_with(~str_c("complete_",.x),.cols = c(value,uppercl,lowercl)) %>% 
+  arrange({{by_col}}) 
+}
+
+make_response_rates_table <- function(x) {
+  x %>% 
+  gt() %>% 
+  fmt_percent(
+    c(starts_with("response_"), starts_with("complete_")),
+    decimals = 0) %>% 
+  cols_merge(starts_with("response_"),pattern = "{1}&nbsp;({2}&#8288;–&#8288;{3})")%>% 
+  cols_merge(starts_with("complete_"),pattern = "{1}&nbsp;({2}&#8288;–&#8288;{3})") %>% 
+  cols_label(
+    sampled ~ "Number sampled",
+    responded ~ "Number responded",
+    completed ~ "Number completed",
+    response_value ~ html("Response&nbsp;rate"),
+    complete_value ~ html("Completion&nbsp;rate")
+  )
+}
+
+make_headings <- function(x)  str_to_sentence(str_replace_all(x,"_"," "))
+
+present <- function(x) sprintf("%1.1f", x)
+
+
+response_rates <- sample %>%
+  get_response_rates(sample_type)
+
+response_rates %>% 
+  make_response_rates_table() %>% 
+  cols_label(sample_type = "Sample")
+  
+```
+
+As we can see, response rates are substantially higher in the major donor booster survey than in the random sample more generally where donors reporting no donations were more common.
+
+To dig into this a bit more, I will divide all respondents into groups based on 2023 recorded donations:
+
+```{r bin-reported-donations}
+# Function for binning reported donations
+
+# Function for binning reported donations
+slice_em <- function(x) cut(x, c(-Inf, 0,5000,25000,Inf),
+                            c("None", "$5K or less",
+                              "$5K to $25K",">$25K"))
+
+
+# Create a column for categorising the sample by binned reported donations
+sliced_sample <- sample %>%
+  mutate(binned_reported_2023 = slice_em(usd_normalised_donations2023))
+
+response_rates_sliced <- sliced_sample %>%
+  get_response_rates(binned_reported_2023)
+  
+response_rates_sliced %>% 
+  make_response_rates_table() %>% 
+  cols_label(
+    binned_reported_2023 ~ "Recorded donations 2023 (USD)"
+  )
+```
+
+Now we can see that response rates correlate with recorded donations. This means that if we take unweighted results for our coefficients, larger donors will be overrepresented in the coefficients. For this reason, I will analyse results with reference to these groups, weighting them appropriately in coefficients where possible.
+
+### Sample representativeness
+
+One thing we want to ascertain is how representative of the entire sample, the respondents really are. As a first step here, we consider how the amount respondents report donating compares to the amount the sample as a whole reports donating.
+
+```{r representativeness-by-sample-type}
+# Create function for summarising the donations of a population
+donations_summary <- function(df,group_col) {
+  df %>% 
+    summarise(
+      n = n(),
+      `Percent with donations` = sum(usd_normalised_donations2023 != 0) / n(),
+
+      `Reported Donations_Mean` = mean(usd_normalised_donations2023),
+      `Reported Donations_SD` = sd(usd_normalised_donations2023),
+      Percentile_75           = quantile(usd_normalised_donations2023, 0.75),
+      Percentile_90          = quantile(usd_normalised_donations2023, 0.9),
+      Percentile_95     = quantile(usd_normalised_donations2023, 0.95),
+      .by = {{group_col}}
+    )
+}
+
+# Create representativeness table by sample type
+bind_rows(
+  list(
+    # Get recorded donation summary stats by population
+    Sample = donations_summary(sample,sample_type),
+    Respondents = donations_summary(filter(sample, responded),sample_type),
+    Completed = donations_summary(filter(sample, completed),sample_type)
+    ),
+  
+  .id = "Sample"
+) %>% 
+  arrange(sample_type,Sample) %>% 
+  # Create table
+  gt(groupname_col = "sample_type") %>% 
+  tab_spanner_delim("_") %>% 
+  fmt_currency(suffixing = T) %>% 
+  fmt_number(n, decimals = 0) %>% 
+  fmt_percent(`Percent with donations`)
+
+```
+
+In terms of reported donations, the respondents from the large donor booster sample seem fairly representative of the large donor booster sample as a whole. However this is very much not the case for the base random sample, which disproportionately over represents those who report donations and those who report more. To see whether this is true across the board or just among those who do not report, we can perform this analysis by recorded donations, among those who record donations:
+
+```{r representativeness-by-amount-donated}
+
+bind_rows(
+  list(
+    Sample = donations_summary(sliced_sample,binned_reported_2023),
+    Respondents = donations_summary(filter(sliced_sample, responded),binned_reported_2023),
+    Completed = donations_summary(filter(sliced_sample, completed),binned_reported_2023)
+    ),
+  
+  .id = "Sample"
+) %>% 
+  filter(binned_reported_2023 != "None") %>% 
+  select(-`Percent with donations`) %>% 
+  arrange(binned_reported_2023,Sample) %>% 
+  gt(groupname_col = "binned_reported_2023") %>% 
+  tab_spanner_delim("_") %>% 
+  fmt_currency(suffixing = T) %>% 
+  fmt_number(n, decimals = 0) 
+```
+
+When we divide the sample into groups based on 2023 reported donations and exclude those those who did not report any donations in 2023, the respondents seem more representative of the sample. However, this was notably least true of donors who reported donating less than $5K in 2023. Overall, we should bear in mind that donors who report less, are less well represented in these survey results.
+
+## Results
+
+### Recording coefficient
+
+#### Accuracy of donations
+
+The question posed in the email sent to pledge donors for this survey varied depending on whether donors had any recorded donations in 2023. For those with recorded donations we asked:
+
+> Our records indicate that in the 2023 calendar year you donated {reported_2023} {currency_code}  to charities or funds you consider to be highly effective. Is this roughly accurate? 
+> Please click one of the options below:
+> 
+>  - Yes, that’s about right.
+>  - No, I gave more.
+>  - No, I gave less.
+
+For those with no recorded donations in 2023 we asked:
+
+> Our records show that in the 2023 calendar year you did not report making any donations to charities or funds you consider to be highly effective. Is this roughly accurate?   
+> Please click one of the options below:
+>  
+> - Correct! I did not make any donations to highly effective charities or funds in 2023. 
+> - Incorrect!  I did make donations to highly effective charities or funds in 2023.
+
+In order to qualify as a respondent, sample members needed to provide an answer to this question.
+
+First, what responses did we receive to these questions, by 2023 recorded donations?
+
+```{r}
+# First create a results dataframe that groups results by amount reported
+slice_results <-  results %>% 
+  mutate(binned_reported_2023 = slice_em(reported_2023_usd))
+
+# Present the responses to the question on donation accuracy by amount reported
+slice_results %>% 
+  summarise(
+    `Number of respondents` = n(),
+    `Accurate` = sum(accurate_2023 == "Yes"),
+    `Too low` =  sum(accurate_2023 == "More"),
+    `Too high` =  sum(accurate_2023 == "Less"),
+    
+    .by = binned_reported_2023
+  ) %>% 
+  arrange(binned_reported_2023) %>% 
+  bind_rows(summarise(., binned_reported_2023 = "Total", across(where(is.numeric), sum))) %>% 
+  phe_proportion(Accurate,`Number of respondents`, "standard") %>% 
+  rename(`Percent records accurate` = value)  %>% 
+  gt(caption = "Accuracy of recorded donations (both samples)") %>% 
+  tab_spanner("Actual 2023 donations relative to reported 2023 donations", 3:5) %>% 
+  fmt_percent(6:8, decimals = 0) %>% 
+  cols_merge(6:8,pattern = "{1} ({2}–{3})") %>% 
+  cols_label(
+    binned_reported_2023 ~ "Reported donations 2023 (USD)"
+  )
+  
+
+
+```
+
+Notably, respondents with lower reported donations reported inaccurate donations at a substantially higher rate than those with more reported donations. This result could be explained by a response bias: those who record no donations or and make no effective donations or who are not meeting their pledge, are probably less likely to respond to this survey than those who are fulfilling their pledge. However, there are other reasons a systematic difference might exist: there is likely a subset of pledgers who donate regularly but choose not to report on the GWWC platform. By definition, these pledgers would have zero recorded platform donations. A key uncertainty (and one we hope surveys like this can partially resolve) is that we do not know how large this subset of donors is.
+
+A few respondents reported that recorded donations are actually an overestimate of their actual donations.
+
+#### Recording coefficient: quantifying the difference
+
+##### Which estimates to include:
+
+Next we want to use this data to roughly estimate the actual recording adjustment we should apply to recorded donation to estimate actual donations.
+
+Those who reported that their recorded donations were inaccurate were asked to provide an actual estimate of their 2023 donations. 
+
+Here we review the confidence that respondents attributed to their estimates of actual donations when they reported their actual donations did not match the donations GWWC has recorded for them. `r nrow( filter(results,!is.na(donations_2023_accuracy)))` respondents provided a response to this question.
+
+> How confident are you that you donated {currency_symbol}{actual_2023} {currency_code} to high-impact charities in 2023?  
+>
+> - Very confident (within 0-5% of the actual amount)  
+> - Fairly confident (within 5-20% of the actual amount)  
+> - Not very confident (within 20-50% of the actual amount)  
+> - Unconfident (it could just as easily be double or half that amount)  
+> - Extremely unconfident (please just ignore the estimate)  
+> - I would like to update my estimate  
+> - Other  
+
+
+```{r}
+
+## Updated estimates
+accuracy_opt = c(0.025,0.0125,0.35 ,1 ,100)
+accuracy_map <- c( "Very confident (within 0-5% of the actual amount)",
+ "Fairly confident (within 5-20% of the actual amount)",
+ "Not very confident (within 20-50% of the actual amount)",
+ "Unconfident (it could just as easily be double or half that amount)",
+ "Extremely unconfident (please just ignore the estimate)")
+
+results %>% 
+  filter(
+    
+    accurate_2023 != "Yes", # Those with inaccurate recorded donations
+    survey_started # who also reported donations
+    ) %>% 
+  count(donations_2023_accuracy) %>% 
+  mutate(donations_2023_accuracy = factor(donations_2023_accuracy, accuracy_opt,accuracy_map),
+        donations_2023_accuracy = fct_na_value_to_level(donations_2023_accuracy,"No response"),
+        pct = n/sum(n)) %>% 
+  arrange(donations_2023_accuracy) %>% 
+  gt(caption = "Question: How confident are you that you donated {currency_symbol}{actual_2023} {currency_code} to high-impact charities in 2023?",
+     rowname_col = 'donations_2023_accuracy') %>% 
+  cols_label(n ~ "Number",
+             pct ~ "Percent") %>% 
+  fmt_percent(pct)
+```
+
+No respondent requested that their estimate be excluded and the majority (~90%) reported that they were at least fairly confident in their estimate. One respondent exited the survey before reporting on the accuracy of their response. I will assume that their response is accurate and not exclude it because:
+
+1) No other respondent requested their response be excluded
+2) This respondent reported their actual donations were *lower* than their recorded donations, so I want to err on the conservative side and include them in the response data.
+
+##### Estimating the recording coefficient
+
+Overall, `r nrow(filter(results,!is.na(donations_2023) | accurate_2023 == "Yes"))` respondents provided an estimate of their actual 2023 donations or confirmed that their 2023 recorded donations were accurate. We want to use these responses to estimate the actual donations of GWWC pledge donors in 2023.
+
+###### Crude estimate: Baseline survey
+
+First we will analyse the results in the same way we did for our previous impact evaluation, that is, we will take the sum of 2023 recorded donations across respondents and the sum of confirmed 2023 donations across respondents and compare these for our counterfactuality coefficient. We will only include respondents in the base random sample and those for whom we have a confirmed estimate of 2023 donations:
+
+```{r}
+base_sample_ids <- sample %>% 
+  filter(sample_type == "Random") %>% 
+  pull(pledge_id)
+
+crude_recording_coefficient <- results %>% 
+  filter(pledge_id %in% base_sample_ids,
+         !is.na(donations_2023_usd)) %>% 
+  summarise(
+    across(c(reported_2023_usd, donations_2023_usd), \(x) sum(x, na.rm = T)),
+    implied_recording_rate = reported_2023_usd/donations_2023_usd,
+    implied_recording_coefficient = donations_2023_usd/reported_2023_usd
+  ) 
+
+crude_recording_coefficient %>% 
+  gt() %>% 
+  cols_label(
+    reported_2023_usd ~ "Recorded donations 2023 (USD)",
+    donations_2023_usd ~ "Actual donations 2023 (USD)",
+    implied_recording_rate ~ "Implied recording rate",
+    implied_recording_coefficient ~ "Implied recording coefficient"
+  ) %>% 
+  fmt_currency(1:2) %>% 
+  fmt_percent(3:4)
+  
+
+
+
+```
+
+This approach returns an implied recording rate of `r present(100*crude_recording_coefficient$implied_recording_rate)`%, very similar to the 78% we estimates in our 2020--2022 impact evaluation. However, there are a few concerns with this approach:
+
+1) It assumes that the respondents match the sample in terms of reported donations In fact, we know that donors with more reported donations responded at high rates and are therefore over-represented
+2) It takes all actual donations for those who reported their reported donations are accurate, but only the updated reported donations for those who reported their donations were not accurate. This will underestimate actual donations slightly, as it will miss cases where respondents reported giving more, but did not update their estimate.  
+3) It does not attempt to account for non-response bias, even though there is likely a strong effect here.
+
+
+###### Weighted estimate
+
+This approach attempts to account for the fact that donors who record more donations are more likely to respond to our survey. To account for this, we will estimate the average difference between actual 2023 donations and reported 2023 donations across the entire sample, while assuming that under- and over-reporting of donations cancels out among non-respondents. 
+
+First, let's import some stats on the recording donation groups we have separated respondents into:
+
+```{r}
+# Get information about population from which sample was taken
+
+# Get recorded donations by pledger for 2023
+pledge_amount_2023_query <- tbl(con, dbplyr::in_schema("reporting", "complete_giving_report")) %>% 
+  mutate(donation_year = year(donation_date)) %>% 
+  filter(
+    !is.na(pledge_id), #Just pledge donations
+    donation_year == 2023 # Just from 2023
+    ) %>% 
+  summarise( 
+    reported_2023_usd = sum(amount_normalized, na.rm= T), # Get 2023 donations by pledge id
+    .by = pledge_id
+  )
+
+# Join recorded 2023 donations by pledger to sample population
+population <- tbl(con, dbplyr::in_schema("pledges", "verified_active_pledge")) %>% 
+    left_join(pledge_amount_2023_query, by = c("id" = "pledge_id")) %>% 
+    mutate(
+      start_year = date_part("year", lower(period)),
+      # Convert recorded donations to zero where non are recorded
+      reported_2023_usd = coalesce(reported_2023_usd, 0 )
+      ) %>% 
+  # Apply filters we did for sampling the population
+  filter(
+    pledge_type == "giving_what_we_can",
+    between(start_year,2009,2022),
+    reported_2023_usd < 445e3 # Exclude top 10 of 2023
+    ) %>% 
+  select(pledge_id = id, reported_2023_usd) %>% 
+  collect() %>% 
+  mutate(binned_reported_2023 = slice_em(reported_2023_usd))
+
+# Summarise results by recorded donation brackets
+population_stats <- population %>% 
+  summarise(
+    .by = binned_reported_2023,
+    total_pledgers_in_population = n(),
+    total_recorded_donations_2023 = sum(reported_2023_usd)
+    ) %>% 
+  mutate(
+    proportion_total_pledgers = total_pledgers_in_population/sum(total_pledgers_in_population),
+    proportion_reported_donations = total_recorded_donations_2023/sum(total_recorded_donations_2023)
+    ) %>% 
+  arrange(binned_reported_2023)
+
+
+population_stats %>% 
+  gt(caption = "Summary statistics for population from which survey sample was drawn") %>% 
+  cols_label_with(fn=make_headings) %>% 
+  fmt_currency(total_recorded_donations_2023, suffixing = T) %>% 
+  fmt_percent(starts_with("proportion"))
+
+```
+
+Next, I will try to estimate the unrecorded donations among our respondents. I will do this by estimating the mean difference between recorded and actual donations among those who:
+
+1) Reported their records were inaccurate
+2) Provided an estimate of actual donations
+
+I will then multiply this by the total number of respondents who reported that their recorded donations were inaccurate in order to estimate the total difference between recorded and actual donations across all respondents.
+
+```{r}
+inaccurate_2023_results <- slice_results %>% 
+  mutate(
+    inaccurate = accurate_2023 !="Yes",
+    inaccurate_updated = !is.na(donations_2023) & inaccurate
+  ) %>% 
+  summarise(
+    provided_updated_estimate = sum(inaccurate_updated),
+    total_recorded_2023 = sum(reported_2023_usd[inaccurate_updated]),
+    total_actual_2023 = sum(donations_2023_usd[inaccurate_updated]),
+    mean_diff = (total_actual_2023 - total_recorded_2023) / provided_updated_estimate,
+    recorded_inaccurate = sum(inaccurate),
+    estimated_total_diff = mean_diff * recorded_inaccurate,
+    .by = binned_reported_2023
+  )
+
+inaccurate_2023_results %>% 
+  gt(caption = "Estimated total difference between 2023 recorded and actual donations among respondents who reported recorded donations were inaccurate by 2023 recorded donation groups") %>% 
+  cols_label_with(fn = make_headings) %>% 
+  fmt_currency(c(contains("mean"),contains("total")), suffixing = T)
+```
+
+We will then take this total difference and divide it by the sample size of each recorded donations group, in order to estimate the average difference between recorded and actual 2023 donations for that recorded donations group across the entire population. This approach implicitly assumes that, among non-respondents, recorded donations are (in aggregate) accurate (i.e., under reporting and over reporting cancel out). We then multiply this by the number of pledgers in this group in the entire population in order to estimate the total difference between recorded and actual 2023 donations:
+
+```{r}
+
+
+unrecorded_donations_by_recorded <- inaccurate_2023_results %>% 
+  select(binned_reported_2023, estimated_total_diff) %>% 
+  # Join count of sample by binned recorded donation group
+  left_join(
+    summarise(sliced_sample, number_sampled = n(), .by = binned_reported_2023),
+    by = join_by(binned_reported_2023)
+  ) %>%
+  # Estimate the mean difference between recorded and actual donations across sample
+  mutate(
+    mean_diff_per_sampled = estimated_total_diff / number_sampled
+  ) %>% 
+  # Join population-level statistics
+  left_join(
+      select(
+        population_stats,
+        binned_reported_2023,
+        number_in_population = total_pledgers_in_population,
+        population_total_recorded_donations_2023 = total_recorded_donations_2023
+      ),
+    by = join_by(binned_reported_2023)
+  ) %>% 
+  # Make estimate of the total diff between recorded and actual across population
+  mutate(
+    estimated_total_population_diff_2023 = number_in_population * mean_diff_per_sampled,
+    implied_recording_coefficient_group = 
+      (estimated_total_population_diff_2023 + population_total_recorded_donations_2023)/
+      population_total_recorded_donations_2023
+  ) 
+
+unrecorded_donations_by_recorded %>% 
+  gt(
+    caption = "Estimated diff between recorded and actual donations by recorded donation group"
+  ) %>% 
+  cols_label_with(fn = make_headings) %>% 
+  fmt_currency(c(contains("mean"),contains("total")), suffixing = T) %>% 
+  fmt_percent(contains("coefficient"))
+```
+
+
+If we then sum the total recorded 2023 donations and the total estimated 2023 difference between recorded and actual donations, we can estimate the recording coefficient for this group of pledgers:
+
+```{r}
+weighted_2023_recording_adjustment <- unrecorded_donations_by_recorded %>% 
+  summarise(
+    total_recorded_2023 = sum(population_total_recorded_donations_2023),
+    estimated_unrecorded_2023 = sum(estimated_total_population_diff_2023),
+    implied_recording_coefficient = (total_recorded_2023 + estimated_unrecorded_2023) / total_recorded_2023
+    )
+
+weighted_2023_recording_adjustment %>% 
+  gt(caption = "Estimated weighted general pledger recording coefficient (2023 donations)") %>% 
+  cols_label_with(fn = make_headings) %>% 
+  fmt_currency(contains("2023"), suffixing = T) %>% 
+  fmt_percent(implied_recording_coefficient)
+```
+
+Overall, this approach implies a recording coefficient of `r present(100*weighted_2023_recording_adjustment$implied_recording_coefficient)`%.
+
+##### Discussion
+
+This approach involves a number of assumptions:
+
+1) Respondents who report their recorded 2023 donations are inaccurate have approximately equal differences regardless of whether they provide an estimate of actual 2023 donations  
+2) Over- and under-reporting of donations among non-respondents approximately cancels out
+
+One potential criticism of this approach is that we have combined the respondents who reported that their recorded donations were too high and those who reported their recorded donations were too low and are treating them as a single group by applying the average 'inaccurate donations' in the group to all those who reported their donations were not accurate. If one of these groups is more likely to go on to provide an actual estimate, then this group will be over-represented in the results. 
+
+In actual fact, reviewing the date, it looks like those who reported their actual donations are lower than their recorded donations were slightly better represented in the final figures than those who reported their actual donations were higher.
+
+```{r}
+
+slice_results %>%
+  # Include only those who reported their donations were inaccurate
+  filter(accurate_2023 != "Yes") %>% 
+  mutate(
+    provided_updated = !is.na(donations_2023),
+    accurate_2023 = factor(
+      accurate_2023, 
+      c("More","Less"),
+      c("Recorded donations too low","Recorded donations too high"))
+    ) %>% 
+  count(
+    provided_updated,
+    accurate_2023,
+  ) %>% 
+  summarise(proportion_provided_updated_figure = n[provided_updated]/sum(n), .by = c(accurate_2023)) %>%
+  gt(
+    caption = "Proportion of respondents who provided updated estimate by response to email question",
+    rowname_col = "accurate_2023"
+    ) %>% 
+  fmt_percent() %>% 
+  cols_label_with(fn = make_headings)
+  
+
+
+```
+
+
+
+#### Recording coefficient: Total donations
+
+```{r}
+count_respondents <- function(df, question){
+  df %>% filter(!is.na({{question}})) %>% nrow()
+}
+results_groups <- results %>% 
+  left_join(select(sample, sample_type, pledge_id), by = "pledge_id")
+
+results_base <- results_groups %>% filter(sample_type == "Random")
+
+```
+
+Next we will attempt to estimate a reasonable independent recording adjustment from the data we have on total donations from the survey. For this approach we will take a crude estimate, which assumes the sample is representative of the wider population. 
+
+##### Total donations recording accuracy  
+
+First, responses to the question about whether total donations were accurate:
+
+> Since your 🔸10% Pledge commenced on {start_date}, our records show you have donated {currency_symbol}{reported_total} {currency_code} *in total* to highly effective charities or funds. Is this roughly accurate?
+>
+>	- Yes 
+>	- No, I gave less
+>	- No, I gave more
+
+In total, `r count_respondents(results, accurate_total)` responded to this question, with  `r count_respondents(results_base, accurate_total)` of these in the base random sample.
+
+```{r}
+summarise_question <- function(df, question) {
+  question_str <- rlang::as_name(rlang::enquo(question))
+  
+  df %>% 
+    filter(!is.na({{question}})) %>% 
+    count({{question}}, sample_type) %>% 
+    mutate(pct = n / sum(n), .by = sample_type) %>% 
+    gt(groupname_col = "sample_type",
+       rowname_col = question_str) %>% 
+    fmt_percent(pct)
+} 
+  
+
+
+results_groups %>% 
+  mutate(accurate_total = factor(accurate_total, c("No, I gave less", "No, I gave more", "Yes", "Updated"))) %>% 
+  summarise_question(accurate_total) %>% 
+  tab_caption("Question:  Since your 🔸10% Pledge commenced on {start_date}, our records show you have donated {currency_symbol}{reported_total} {currency_code} *in total* to highly effective charities or funds. Is this roughly accurate?")
+  
+
+```
+
+##### Total donation updated estimate precision  
+
+Next, responses to the question about how accurate updated total donations were:
+
+> How confident are you that you have donated  {currency_symbol}{donations_total} {currency_code} since your 🔸10% Pledge commenced on {start_date}?  
+>  
+> - Very confident (within 0-5% of the actual amount)  
+> - Fairly confident (within 5-20% of the actual amount)  
+> - Not very confident (within 20-50% of the actual amount)  
+> - Unconfident (it could just as easily be double or half that amount)  
+> - Extremely unconfident (please just ignore the estimate)  
+> - I would like to update my estimate  
+> - Other  
+
+In total, `r count_respondents(results, donation_total_accuracy)` responded to this question, with  `r count_respondents(results_base, donation_total_accuracy)` of these in the base random sample. 
+
+```{r}
+
+results_groups %>% 
+  mutate(donation_total_accuracy = factor(donation_total_accuracy, accuracy_opt,accuracy_map)) %>% 
+  summarise_question(donation_total_accuracy) %>% 
+  tab_caption("Question:  Since your 🔸10% Pledge commenced on {start_date}, our records show you have donated {currency_symbol}{reported_total} {currency_code} *in total* to highly effective charities or funds. Is this roughly accurate?")
+  
+
+```
+
+##### Recording coefficient --- Total donations
+
+Finally, let's estimate a recording adjustment for our base random sample, considering only respondents who gave an estimate of accuracy. This will be a simple unweighted estimate. Among respondents who confirmed/provided an updated estimate of total donations, we will takes the total sum of confirmed total pledge donations and divide this by the sum of recorded pledge donations.
+
+```{r}
+
+recording_coefficient_crude_total <- results_base %>% 
+  # Update actual donations for all donors who confirmed total donations
+  mutate(donations_total_usd = if_else(accurate_total == "Yes", 
+                                       reported_total_usd,
+                                       donations_total_usd)) %>% 
+  # Only include where total donations are confirmed and an estimate of accuracy has been included
+  filter(
+    !is.na(donations_total_usd),
+    donation_total_accuracy %in% accuracy_opt | accurate_total == "Yes"
+    ) %>% 
+  summarise(
+    across(c(donations_total_usd, reported_total_usd), sum),
+    recording_coefficient = donations_total_usd/reported_total_usd
+    ) 
+
+recording_coefficient_crude_total %>% 
+  gt(caption = "Recording coefficient estimated crudely from total donation survey responses") %>% 
+  cols_label_with(fn = make_headings) %>% 
+  fmt_percent(recording_coefficient) %>% 
+  fmt_currency(ends_with("usd"), suffixing = T)
+  
+```
+
+### Counterfactuality coefficient
+
+Here I will estimate a counterfactuality adjustment from the results of this survey. This adjustment will be weighted by recorded donations to try and account for bias in responses. 
+
+#### Background
+
+In addition to confirming their actual 2023 donations, respondents were asked to provide an estimate of the amount they would have given in 2023 if they have never encountered Giving What We Can:
+
+> If you had never encountered Giving What We Can and its donation platform, how much do you think you would have donated to highly effective charities or funds *in the 2023 calendar year?* Please give your best guess.
+
+```{r}
+counterfactual_results <- slice_results %>% 
+  filter(!is.na(counterfactual_donations_2023)) %>% 
+  mutate(
+    counterfactual_fraction = (donations_2023_usd-counterfactual_donations_2023) / donations_2023_usd,
+    counterfactual_category = case_when(
+      donations_2023_usd < counterfactual_donations_2023_usd ~ "Negative effect",
+      donations_2023_usd > counterfactual_donations_2023_usd ~ "Positive effect",
+      donations_2023_usd == counterfactual_donations_2023_usd ~ "No effect"
+        )
+    ) 
+
+counterfactual_results %>% 
+  tabyl(binned_reported_2023, counterfactual_category) %>% 
+  bind_rows(summarise(., across(where(is.numeric), sum), 
+                      binned_reported_2023 = "Total")) %>% 
+  mutate(`Percent positive` = `Positive effect` / rowSums(across(ends_with("effect")))) %>% 
+  gt(rowname_col = "binned_reported_2023") %>% 
+  fmt_percent(`Percent positive`)
+
+```
+
+Notably, three respondents reported that GWWC had a negative influence on the amount they donated to highly effective charities. In two of these cases, respondents provided free text responses that provide some context on this:
+
+- One respondent who had $0 in reported donations to effective charities/funds and confirmed this was correct in response to the email question, responded that if they hadn't encountered GWWC, then they would have donated \$90,000 in 2023. However, in a free text question later they confirmed that they donated \$90,000 to a DAF in 2023 and that "It'll go to a highly effective charity at some point; we're just behind on execution". We are fairly confident in this case that GWWC has not actually caused this person to donate \$90,000 less in 2023 and that they simply elected not to include DAF donations when confirming their 2023 donations. 
+- Another respondent who also had $0 in reported donations reported that if they hadn't encountered GWWC, they would have donated \$5000 in 2023. This respondent reported that they only started their pledge in 2024. In this case, we sampled respondents on the basis that their pledge started prior to 2023, but failed to exclude pledgers who had backdated their pledge (as was the case here). In this case, not enough information has been provided to determine whether GWWC actually caused the respondent to donate less and so we included this estimate in our overall coefficient where possible.
+
+###### Crude estimate: Baseline survey
+
+```{r}
+responded_counterfactuals <- filter(results, !is.na(counterfactual_donations_2023)) %>% 
+  pull(pledge_id)
+```
+
+First we will analyse the results in the same way we did for our previous impact evaluation, that is, we will take the total donations across respondents and the total counterfactual donations across respondents and compare these for our counterfactuality coefficient. In total `r length(responded_counterfactuals)` respondents provided a counterfactual estimate. 
+
+```{r}
+discount_non_response <- function(respondent_rate, response_rate, adjustment){
+  respondent_rate * response_rate + 
+    respondent_rate * (1-response_rate) * adjustment
+}
+
+
+# Get response rates to this question
+counterfactuality_response_rates <- 
+  length(responded_counterfactuals)/nrow(sample)
+ 
+
+results %>% 
+  filter(
+    pledge_id %in% base_sample_ids, # For respondents in the base random sample
+         !is.na(counterfactual_donations_2023_usd) # Who provided a counterfactual estimate
+    ) %>% 
+  summarise(
+    across(c(counterfactual_donations_2023_usd, donations_2023_usd), \(x) sum(x, na.rm = T)),
+    implied_counterfactual_coefficient = (donations_2023_usd-counterfactual_donations_2023_usd)/donations_2023_usd,
+    response_rate = counterfactuality_response_rates,
+    coefficient_50pct_nonresponse_discount = discount_non_response(
+      implied_counterfactual_coefficient, response_rate, 0.5
+    ),
+    coefficient_75pct_nonresponse_discount = discount_non_response(
+      implied_counterfactual_coefficient, response_rate, 0.25
+    )
+  ) %>% 
+  gt(caption = "Crude counterfactual coefficient estimate from survey") %>% 
+  cols_label_with(fn = make_headings) %>% 
+  cols_label(
+    donations_2023_usd ~ "Actual donations 2023 (USD)",
+    counterfactual_donations_2023_usd ~ "Counterfactual donations 2023 (USD)",
+  ) %>% 
+  
+  fmt_currency(1:2) %>% 
+  fmt_percent(3:6)
+  
+```
+
+This implied counterfactuality adjustment of 46% is notably higher than that estimated from a similar survey in our 2020--2022 evaluation (34%), although notably, this sample is substantially larger. As with previously, this approach underrepresents the smaller donors with lower response rates and so a weighted approach to estimating the counterfactual coefficient may be more accurate.
+
+If we assume the donor who reported GWWC caused them to donate \$90,000, actually meant to report that GWWC had no effect on their donations, we get a different coefficient.
+
+```{r}
+results_recode <- results %>% 
+  filter(
+    pledge_id %in% base_sample_ids, # For respondents in the base random sample
+         !is.na(counterfactual_donations_2023) # Who provided a counterfactual estimate
+    ) %>% 
+  mutate(donations_2023_usd = case_when(
+        run ==15010251 ~ counterfactual_donations_2023_usd, 
+        .default = donations_2023_usd
+    )
+  ) 
+
+results_recode %>% 
+  summarise(
+    across(c(counterfactual_donations_2023_usd, donations_2023_usd), \(x) sum(x, na.rm = F)),
+    implied_counterfactual_coefficient = (donations_2023_usd-counterfactual_donations_2023_usd)/donations_2023_usd,
+    response_rate = counterfactuality_response_rates,
+    coefficient_50pct_nonresponse_discount = discount_non_response(
+      implied_counterfactual_coefficient, response_rate, 0.5
+    ),
+    coefficient_75pct_nonresponse_discount = discount_non_response(
+      implied_counterfactual_coefficient, response_rate, 0.25
+    )
+  ) %>% 
+  gt(caption = "Crude counterfactual coefficient estimate from survey, excluding likely erroneous response") %>% 
+  cols_label_with(fn = make_headings) %>% 
+  cols_label(
+    donations_2023_usd ~ "Actual donations 2023 (USD)",
+    counterfactual_donations_2023_usd ~ "Counterfactual donations 2023 (USD)",
+  ) %>% 
+  
+  fmt_currency(1:2) %>% 
+  fmt_percent(3:6)
+  
+```
+
+However, this approach remains flawed in that it discounts for non-response bias based on the number of non-respondents rather than discounting for non-response bias based on the volume of donations from non-respondents. Many non-respondents recorded $0 in donations and so by discounting based on the number of non-respondents we are effectively discounting the recorded donations of others in the sample.
+
+Instead let's estimate a coefficient weighting the non-response discount by the proportion of recorded donations among non-respondents.
+
+```{r}
+prop_recorded_with_counterfactual <- sample %>% 
+  mutate(provided_counterfactual = pledge_id %in% responded_counterfactuals,
+         sample_type == "Random") %>% 
+  summarise(
+    recorded_2023 = sum(usd_normalised_donations2023),
+    recorded_2023_from_counterfactual_respondents = sum(usd_normalised_donations2023[provided_counterfactual]),
+    proportion_recorded_in_sample_from_respondents = recorded_2023_from_counterfactual_respondents/recorded_2023
+    ) 
+
+prop_recorded_with_counterfactual %>% 
+  gt(caption = "Proportion of recorded donations in sample that were from non-respondents") %>% 
+  cols_label_with(fn = make_headings) %>% 
+  fmt_currency(1:2, suffixing = T) %>% 
+  fmt_percent(3)
+```
+
+
+```{r}
+results_recode %>% 
+  summarise(
+    across(c(counterfactual_donations_2023_usd, donations_2023_usd), \(x) sum(x, na.rm = F)),
+    implied_counterfactual_coefficient = (donations_2023_usd-counterfactual_donations_2023_usd)/donations_2023_usd,
+    proportion_recorded_in_sample_from_respondents = 
+      prop_recorded_with_counterfactual$proportion_recorded_in_sample_from_respondents,
+    coefficient_50pct_nonresponse_discount = discount_non_response(
+      implied_counterfactual_coefficient, proportion_recorded_in_sample_from_respondents, 0.5
+    ),
+    coefficient_75pct_nonresponse_discount = discount_non_response(
+      implied_counterfactual_coefficient, proportion_recorded_in_sample_from_respondents, 0.25
+    )
+  ) %>% 
+  gt(caption = "Crude counterfactual coefficient estimate from survey, excluding likely erroneous response, non-response discount weighted by recorded donation volume") %>% 
+  cols_label_with(fn = make_headings) %>% 
+  cols_label(
+    donations_2023_usd ~ "Actual donations 2023 (USD)",
+    counterfactual_donations_2023_usd ~ "Counterfactual donations 2023 (USD)",
+  ) %>% 
+  
+  fmt_currency(1:2) %>% 
+  fmt_percent(3:6)
+
+```
+
+
+##### Reported-donations-weighted estimate
+
+Here I will calculate a counterfactuality coefficient that better accounts for donor size. This will involve first estimating the counterfactuality coefficient for each of our donation groups and then estimate an overall counterfactuality coefficient that weights the counterfactuality coefficient for each group by each group's contribution to total recorded donations.
+
+First, we need to estimate the proportion of donations that respondents reported to be counterfactually influenced by Giving What We Can. In the below table I will divide donors into groups based on their *actual* donations, then estimate the fraction of donations in each group that respondents reported was counterfactually caused by GWWC. I will then estimate counterfactuality coefficients for each group, by taking the fraction of counterfactual donations among respondents and assume a discounted counterfactual coefficient among non-respondents donations. To bin non-respondents by donor size, I need to use reported donations rather than actual donations, as most non-respondents did not provide an estimate of actual donations.  
+
+```{r counterfactual-coefficient-by-donor-size}
+# Get proportion of recorded donations among respondents by 2023 reported donations
+proportion_recorded_respondents_counterfactual_sliced <- sliced_sample %>% 
+  summarise(
+    recorded_2023_donations_among_counterfactual_respondents = sum(usd_normalised_donations2023[pledge_id %in% responded_counterfactuals]),
+    recorded_2023_donations = sum(usd_normalised_donations2023),
+    proportion_recorded_2023_from_counterfactual_respondents = 
+      recorded_2023_donations_among_counterfactual_respondents/
+      recorded_2023_donations,
+    .by = binned_reported_2023
+  ) %>% 
+  select(binned_reported_2023,proportion_recorded_2023_from_counterfactual_respondents)
+  
+
+# Get counterfactual coefficients by actual donations
+group_wise_counterfactual_coefficients <- results_recode %>%
+  mutate(binned_actual_2023 = slice_em(donations_2023_usd)) %>% 
+  summarise(
+    .by = binned_actual_2023,
+    respondents = n(),
+    # Get total 2023 donations
+    total_donations = sum(donations_2023_usd),
+    # Get 2023 donations that would not have occured if the donor had not encountered GWWC 
+    total_counterfactual_donations = sum(donations_2023_usd - counterfactual_donations_2023_usd),
+    # Get counterfactuality coefficient among respondents
+    group_counterfactual_percent = total_counterfactual_donations / total_donations
+    ) %>% 
+  # Add proportion of sample recorded donations among respondents 
+  # (by 2023 reported donations) for counterfactuality question 
+  left_join(proportion_recorded_respondents_counterfactual_sliced, 
+            by = join_by(binned_actual_2023 == binned_reported_2023)) %>% 
+  mutate(
+    # Apply discounts for non-respondents
+    coefficient_nonresponse_discount_50pct = discount_non_response(
+      group_counterfactual_percent, proportion_recorded_2023_from_counterfactual_respondents, 0.5),
+    coefficient_nonresponse_discount_75pct = discount_non_response(
+      group_counterfactual_percent, proportion_recorded_2023_from_counterfactual_respondents, 0.25)
+    ) %>% 
+  arrange(binned_actual_2023)
+
+
+# Tabulate results
+group_wise_counterfactual_coefficients %>% 
+  gt() %>% 
+  fmt_currency(ends_with("donations"), suffixing = T) %>% 
+  fmt_percent(contains(c("coefficient","rate","percent"))) %>% 
+  cols_label_with(fn = ~str_to_sentence(str_replace_all(.x,"_"," ")))
+
+```
+
+Next we get the proportion of total recorded donations made by pledgers in these donations groups for weighting the counterfactuality coefficients. Note that for this estimate we are using recorded donations while for estimating counterfactuality coefficients themselves, we are bucketing respondents by their actual donations, this means the weighting will be slightly skewed on account of respondents who reported donations are inaccurate, but we expect this effect to be small.
+
+```{r estimate-weighted-counterfactuality-coefficient}
+
+
+group_wise_counterfactual_coefficients %>% 
+  left_join(population_stats, by = join_by(binned_actual_2023 == binned_reported_2023)) %>% 
+  filter(binned_actual_2023 != "None") %>%
+  select(binned_actual_2023,group_counterfactual_percent,coefficient_nonresponse_discount_50pct,
+         coefficient_nonresponse_discount_75pct, proportion_reported_donations) %>% 
+  arrange(binned_actual_2023) %>% 
+  gt() %>% 
+  fmt_percent() %>% 
+  cols_label_with(fn = ~str_to_sentence(str_replace_all(.x,"_"," "))) %>% 
+  grand_summary_rows(c(group_counterfactual_percent,coefficient_nonresponse_discount_50pct,
+         coefficient_nonresponse_discount_75pct),
+                     fns = list("Weighted counterfactual coefficient" = ~sum(.x *proportion_reported_donations)),
+                     fmt = ~fmt_percent(.x))
+  
+
+```
+
+A limitation of this approach is that we implicitly exclude respondents who donated nothing in 2023, but report they would have donated more if they had never encountered GWWC. This is because these donors contribute 0% to overall donations and so are given 0 weighting in overall adjustment. 

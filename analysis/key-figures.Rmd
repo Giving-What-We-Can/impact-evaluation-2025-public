@@ -1,0 +1,946 @@
+---
+title: "Key 2023–2024 impact evaluation inputs"
+output: html_document
+date: "2025-04-14"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r packages}
+pacman::p_load(tidyverse, dbplyr, gt)
+```
+
+```{r params}
+theme_set(theme_bw())
+theme_update(legend.position = "bottom", plot.title.position = "plot")
+
+```
+
+```{r connect-parfit}
+# Establish read connect to parfit
+source("connect-parfit.R")
+```
+
+## Non-pledge donations 2023--2024
+
+This is intended to calculate all non-pledge facilitated donations between 2023 and 2024. The result should:
+
+- Be normalised to USD and inflation adjusted to 2024 USD
+- Exclude all yearly donations from a donor, where the donor gave more than 140,000 in 2024 USD in that year
+
+Years where a donor gives more than $140K are excluded because 140K USD is the amount given by the smallest major non-pledge donor surveyed and this group reported no counterfactual influence of GWWC on their donations.
+
+```{r}
+inflation_adjustments <- tbl(con, in_schema("impact_surveys","inflation_data"))
+
+# Create a version of the Giving Report with inflation adjusted amounts
+giving_report_inf_adj <- tbl(con, in_schema("reporting", "complete_giving_report")) %>% 
+  # Get donation year
+  mutate(donation_year = year(donation_date)) %>% 
+  # Join inflation adjustments and apply to USD normalised donations
+  left_join(inflation_adjustments, join_by(donation_year == year)) %>% 
+  mutate(amount_adj_norm = amount_normalized * cumulative_inflation_to_2024) 
+
+total_non_pledge_donations_period <- giving_report_inf_adj %>% 
+  filter(
+    is.na(pledge_id), # Exclude pledge donations
+    object_type == "payment",  # Exclude reported donations
+    donation_year %in% 2023:2024, # Filter to include donations in period
+    sum(amount_adj_norm, na.rm = TRUE) <= 139e3, # Exclude where total donations exceed 140K...
+    .by = c(person_id, donation_year) # For a given person-year
+    )  %>% 
+  # Get sum of normalised, inflation adjusted donations
+  summarise(total_non_pledge_period = sum(amount_adj_norm, na.rm = T)) %>% 
+  collect() 
+
+# Present in a table
+total_non_pledge_donations_period %>% 
+  gt() %>% 
+  fmt_currency()
+    
+```
+
+## Pledge donations in 2023--2024
+
+This is intended to calculate all pledge (10% and Trial Pledge) donations (reported and facilitated) between 2023 and 2024. The result should:
+
+- Include only donations from verified pledges
+- Exclude donations made prior to the pledge start date
+- Exclude pledgers whose average annual pledge donations exceed $1M (this group reported no counterfactual influence in our survey)
+
+```{r}
+# Get active 10% pledges that started between 2009 and 2024
+active_10pledges <- tbl(con, in_schema("pledges","verified_active_pledge")) %>% 
+  mutate(start_date = lower(period),
+         pledge_cohort = year(start_date)) %>% 
+  filter(pledge_type == "giving_what_we_can",
+         between(year(start_date),2009, 2024)
+         )%>% 
+  select(pledge_id = id, start_date, pledge_cohort)
+
+
+# Get 10% pledgers who give on average 1M per year
+average_1M_pledgers <- giving_report_inf_adj %>% 
+  # Get total donations by pledge id
+  summarise(total_donations = sum(amount_adj_norm, na.rm = T), 
+            .by = c(pledge_id,person_id)) %>% 
+  # Include active 10 percent pledges only
+  inner_join(
+   active_10pledges,
+    by = "pledge_id"
+  ) %>% 
+  mutate(
+    # Get Pledge age
+    pledge_age = as.numeric(today() - start_date) / 365.25,
+    # Get total pledge donations
+    average_annual_donation = total_donations / pledge_age
+    ) %>% 
+  # Get cases where average annual donations exceed 1M
+  filter(average_annual_donation >1e6) %>%  
+  collect() 
+
+```
+
+
+```{r}
+
+donations_pledge_in_period <- giving_report_inf_adj %>% 
+  # Only include verified pledges with an inner join
+  inner_join(tbl(con, in_schema("pledges","verified_pledge")), by = join_by(pledge_id == id)) %>% 
+  filter(
+    between(year(donation_date), 2023,2024), # Include donations in period
+    lower(period) <= donation_date, # Only include donations made after the pledge
+    # Exclude very large pledgers with no GWWC influence
+    !pledge_id %in% average_1M_pledgers$pledge_id
+    ) %>% 
+  summarise(total_pledge_donations_period = sum(amount_adj_norm)) %>% 
+  collect()
+
+
+donations_pledge_in_period %>% 
+  gt() %>% 
+  fmt_currency()
+```
+
+## Number of new pledges in period
+
+This is intended to calculate the number of new pledges (10% and Trial Pledges) in 2023 and 2024, calculate the number of pledges that ended in this period and the net change in the number of these pledges. Ultimately, I am interested in the net change in 10% pledges and the number of new trial pledges. Both figures should:
+
+- Include only verified pledges
+- Include only pledges created during the 2023--2024 period
+- Include only pledges whose start date was set to be prior to 2026
+
+
+```{r}
+
+net_change_in_pledges <- tbl(con, in_schema("pledges","verified_pledge")) %>% 
+  mutate(start_year = year(lower(period)),
+         end_year = year(upper(period)),
+         end_in_period = end_year %in% 2023:2024,
+         created_year = year(created_at),
+         created_in_period = created_year %in% 2023:2024 
+         & start_year <= 2025
+        ) %>% 
+  summarise(
+    new_pledges_in_period = sum(as.integer(created_in_period)),
+    pledges_ending_in_period = sum(as.integer(end_in_period)),
+    .by = pledge_type) %>% 
+  mutate(net_change_in_pledges = new_pledges_in_period - pledges_ending_in_period) %>% 
+  collect() 
+
+
+net_change_in_pledges %>%
+  gt(caption = "New Trial Pledges and net change in 10% Pledges between 2023 and 2024")
+
+```
+
+## Average lifetime trial pledge donations
+
+Here I want to estimate the average lifetime donations (facilitated and reported) for a trial pledge. This figure should:
+
+- Include inflation-adjusted (to 2024) totals normalised to USD
+- Include only completed Trial Pledges
+- Include only Trial Pledges that commenced in 2014 or later
+- Include only trial pledges that started at least one year ago
+- Only include donations made after the pledge start date
+- Exclude pledges where the annualised average amount donated exceeded 1M USD (e.g., less than 500K for a 6 month trial pledge, etc.)
+
+
+```{r}
+completed_trial_pledges <- tbl(con, in_schema("pledges","verified_pledge")) %>% 
+  filter(pledge_type == "try_giving",
+         upper(period) < today(), # Trial Pledges Completed Prior to today
+         year(lower(period)) >= 2014, # Start year after 2014
+         sql("lower(period) <= current_date - interval '1 year'") # Pledge must have started at least one year ago
+         ) 
+
+trial_pledge_donations <- giving_report_inf_adj %>% 
+  inner_join(completed_trial_pledges, by = join_by(pledge_id == id)) %>% 
+  filter(
+     lower(period) <= donation_date, # Only include donations made after the pledge
+  ) %>% 
+  # Get total donations by Trial Pledge
+  summarise(total_donations = sum(amount_adj_norm, na.rm = T), .by = pledge_id) %>% 
+  # Join Trial pledges with $0 donated
+  right_join(completed_trial_pledges, by = join_by(pledge_id == id)) %>% 
+  mutate(
+    # Set missing total donations to zero
+    total_donations = coalesce(total_donations, 0),
+    start_year = year(lower(period)),
+    pledge_duration_years =  as.numeric(upper(period) - lower(period)) / 365.25,
+    average_donations_per_year = total_donations / pledge_duration_years,
+    .keep = "used"
+    ) %>% 
+  collect() %>% 
+  # Pledges started at least one year ago
+  filter(
+    average_donations_per_year < 1e6 # Annual donation rate should be less than $1M 
+    ) 
+  
+trial_pledge_donations %>% 
+  mutate(start_year = as.character(start_year)) %>% 
+  # Get average across all Trial pledges
+  bind_rows(
+    mutate(trial_pledge_donations, start_year = "All")
+  ) %>% 
+  # Get average_since2020 for conservative estimate
+  bind_rows(mutate(
+    filter(trial_pledge_donations, start_year>= 2020), 
+    start_year = "From 2020–2023"
+    )) %>% 
+  summarise(mean_trial_pledge_donations = mean(total_donations), 
+            num_pledges_completed = n(),
+            .by = start_year) %>% 
+  arrange(start_year) %>% 
+  gt(caption = "Average donations per completed trial pledge") %>% 
+  fmt_currency(mean_trial_pledge_donations)
+  
+
+```
+
+## Trial Pledge conversion rate
+
+Estimate the proportion of Trial Pledge takers who go on to take a 10% Pledge. This figure should:
+
+- Only include verified Trial Pledges
+- Only include verified Active 10% Pledges
+- Only include Trial Pledges completed prior to the start of 2025
+- Only include Trial pledges commenced between 2014 and 2023 (excl 2024)
+- Only count one conversion per person (even if they had multiple trial pledges)
+
+I aim to count the number of people who took a Trial Pledge who later took a 10% Pledge, and to separately count the number of people who took a Trial Pledge who took a 10% Pledge within 1 year of their Trial Pledge ending.
+
+
+```{r}
+active_10pct_pledges <- tbl(con, in_schema("pledges","verified_active_pledge")) %>% 
+  filter(pledge_type == "giving_what_we_can") %>% 
+  select(person_id, id_10pct = id, period_10pct = period, 
+         created_at_10pct = created_at)
+
+trial_pledge_conversion <-  tbl(con, in_schema("pledges","verified_pledge")) %>% 
+  filter(pledge_type == "try_giving",
+         year(upper(period)) < 2025, # Trial Pledges Completed prior to 2025
+         between(year(lower(period)), 2014, 2023), # Start year after 2014
+         )  %>% 
+  mutate(trial_end_date = upper(period)) %>% 
+  # Join 10% pledges by person_id
+  left_join(active_10pct_pledges, by = "person_id") %>% 
+  # Get conversion time in years
+  mutate(
+    conversion_time_years = (lower(period_10pct) - trial_end_date)/365.25,
+    start_year = year(lower(period))
+    ) %>% 
+  collect()
+  
+trial_pledge_conversion %>% 
+  summarise(
+    # Number of trial pledges
+    trial_pledges = n(),
+    # Unique persons who took GWWC pledge after completion of a trial pledge, 
+    # Taking unique persons prevents double counting those with multiple trial pledges
+    conversions = n_distinct(person_id[!is.na(conversion_time_years)]),
+    conversions_in_year = n_distinct(person_id[conversion_time_years <= 1]),
+    .by = start_year
+  ) %>% 
+  # Add summary row on the bottom
+  bind_rows(summarise(., start_year = 9999, across(where(is.numeric), sum))) %>% 
+  arrange(start_year) %>% 
+  # Get conversion rates
+  mutate(
+    conversion_rate_ever = conversions / trial_pledges,
+    conversion_rate_within_year = conversions_in_year / trial_pledges
+    ) %>% 
+  # Format in table
+  gt(caption = "Trial pledge conversion by year of Trial Pledge start") %>% 
+  fmt_percent(contains("rate")) %>% 
+  text_replace("9999", "Total")
+```
+
+Plot of pledge conversion for interest:
+
+```{r}
+trial_pledge_conversion %>% 
+  filter(
+    !is.na(conversion_time_years), # Only successful conversions
+    # Only conversion for the most recent trial pledge for the person
+    conversion_time_years == min(conversion_time_years),
+    .by = person_id) %>% 
+  # Plot
+  count(conversion_time_years) %>%
+  arrange(conversion_time_years) %>% 
+  mutate(cum_percent = cumsum(n)/sum(n)) %>% 
+  ggplot(aes(x=conversion_time_years, y =cum_percent)) +
+  geom_line() +
+  labs(x = "Trial pledge conversion time (years since end of most recent trial pledge)",
+       y = NULL,
+       subtitle = "Cumulative proportion of all conversions") +
+  ylim(0,1) 
+
+```
+
+
+## Fraction of 2023 pledge donations from surveyed large donors
+
+In order to determine how the recording adjustments from the PCV/PRAC survey and MPCV surveys should be weighted, we need to understand the relative contribution of both of these groups to total recorded donations.
+
+Here I aim to estimate the proportion of donations that those surveyed in the major pledge counterfactual value survey contributed to total recorded pledge donations in 2023. I will exclude:
+
+- Pledgers who donate an average of >1M per year in 2024 USD  
+- Pledgers who pledged in 2023 or later  
+
+
+
+```{r}
+sample_pop <- tbl(con, in_schema("pledges","verified_active_pledge")) %>% 
+  filter(
+    pledge_type == "giving_what_we_can",
+    between(year(lower(period)), 2009, 2022)
+  )
+
+
+giving_report_inf_adj %>% 
+  # Only include verified pledges with an inner join
+  inner_join(
+    sample_pop,
+    by = join_by(pledge_id == id)
+    ) %>% 
+  filter(
+    year(donation_date) == 2023, # Include donations in 2023
+    # Exclude very large pledgers with no GWWC influence
+    !pledge_id %in% average_1M_pledgers$pledge_id
+    ) %>% 
+  left_join(
+    # Join MPCV Sample to Identify these donors
+    tbl(con, in_schema("impact_surveys","mpcv2025_sample")), 
+    by = join_by(pledge_id)
+  ) %>% 
+  # Tag these as major pledge donors
+  mutate(major_pledger_group = !is.na(`2023_top_10`)) %>% 
+  # Get total donated by group
+  summarise(pledge_donations_2023 = sum(amount_adj_norm),
+            mean_donations = mean(amount_adj_norm),
+            number_pledgers = n_distinct(pledge_id), .by = major_pledger_group) %>% 
+  mutate(proportion_donations = pledge_donations_2023/sum(pledge_donations_2023)) %>% 
+  collect() %>% 
+  gt(caption = "Proportion of 2023 donations from the major pledger group (excluding those with >$1 M donations per year)") %>% 
+  fmt_currency(2:3, suffixing = T) %>% 
+  fmt_percent(5)
+
+
+
+```
+
+## Average age at pledge
+
+Here I want to identify the average age of pledgers whose pledges commenced in 2023 and 2024. First I will import age at pledging for all verified pledgers. Because a small minority of pledger ages seem unreliable (e.g., 0 or 115), I will filter to just include those between 16 and 100 years of age at pledging. I am most interested in 10% Pledgers, but I will also analyse Trial Pledgers just for interest.
+
+```{r}
+pledge_age_by_cohort_both <- tbl(con, in_schema("pledges", "verified_pledge")) %>% 
+  left_join(
+    tbl(con, in_schema("people", "person")),
+    by = join_by(person_id == id)
+  ) %>% 
+  mutate(pledge_start = lower(period), 
+         pledge_cohort = year(pledge_start)) %>% 
+  filter(between(pledge_cohort,2009,2024)) %>% 
+  mutate(
+    age_at_pledge = sql("(pledge_start - birth_date) / 365.25")
+  ) %>% 
+  select(age_at_pledge, pledge_cohort, pledge_type) %>% 
+  collect() %>% 
+  # Recode pledgers younger than 15 or older than 100
+  mutate(age_at_pledge = case_when(between(age_at_pledge, 16,100) ~ age_at_pledge))
+```
+
+### 10% Pledge 
+
+```{r}
+pledge_age_by_cohort <- pledge_age_by_cohort_both %>% 
+  filter(pledge_type == "giving_what_we_can")
+  
+```
+
+First let's visualise age at pledging as a histogram (all pledges):
+
+```{r}
+pledge_age_by_cohort %>% 
+  filter(!is.na(age_at_pledge)) %>% 
+  ggplot(aes(age_at_pledge, fill = pledge_type)) +
+  geom_histogram(binwidth = 2.5,boundary = 0, fill = "#e86f2b", colour = "black") +
+  labs(
+    y = NULL,
+    subtitle = "Count",
+    x = "Age at pledge (Years)"
+  ) +
+  scale_y_continuous(expand = expansion(c(0,0.05))) +
+  scale_x_continuous(breaks = \(x) seq(0,x[2], 5))
+
+```
+
+
+Across all 10% pledgers, the mean age at pledge is `r mean(pledge_age_by_cohort$age_at_pledge,na.rm=T)` years.
+
+Next, we will estimate the average age at pledging by pledger cohort:
+
+```{r}
+pledge_age_summary <- pledge_age_by_cohort %>% 
+  summarise(
+    number_pledges = n(),
+    number_age_provided = sum(!is.na(age_at_pledge)),
+    percent_age_provided = number_age_provided/number_pledges,
+    mean_age = mean(age_at_pledge, na.rm = T),
+    median_age = median(age_at_pledge, na.rm = T),
+    .by = pledge_cohort) %>% 
+  arrange(pledge_cohort)
+
+pledge_age_summary %>% 
+  ggplot(aes(x = pledge_cohort)) +
+  geom_line(aes(y = mean_age, colour = "Mean"), linewidth = 1) +
+  geom_line(aes(y = median_age, colour = "Median"), linewidth = 1) +
+  labs(
+    subtitle = "Age (years)",
+    y = NULL,
+    x = "Year pledged",
+    colour = "Statistic"
+  ) +
+  scale_y_continuous(limits = c(0,NA), breaks = seq(0,35,5))+
+  scale_x_continuous(breaks = \(x) 2009:x[2])
+```
+
+```{r}
+
+pledge_age_summary %>% 
+  gt(caption = "Pledge age statistics by 10% Pledge start year") %>% 
+  cols_label_with(fn = ~str_to_sentence(str_replace_all(.x,"_"," "))) %>% 
+  fmt_percent(contains("percent")) %>% 
+  fmt_number(ends_with("_age"))
+
+```
+
+Finally, lets get the mean age of pledgers who pledged in 2023 and 2024:
+
+```{r mean-age-2023-2024-pledgers}
+
+pledge_age_by_cohort %>% 
+  filter(pledge_cohort %in% c(2023,2024)) %>% 
+  summarise(
+    number_pledges = n(),
+    number_age_provided = sum(!is.na(age_at_pledge)),
+    percent_age_provided = number_age_provided/number_pledges,
+    mean_age = mean(age_at_pledge, na.rm = T),
+    median_age = median(age_at_pledge, na.rm = T)
+    ) %>% 
+  gt(
+    caption = "Pledge age statistics for 10% Pledges starting in 2023 and 2024"
+  )%>% 
+  cols_label_with(fn = ~str_to_sentence(str_replace_all(.x,"_"," "))) %>% 
+  fmt_percent(contains("percent")) %>% 
+  fmt_number(ends_with("_age"))
+
+```
+
+### Trial pledge
+
+```{r}
+pledge_age_by_cohort_trial <- pledge_age_by_cohort_both %>% 
+  filter(pledge_type == "try_giving", between(pledge_cohort,2014,2024)) 
+```
+
+
+```{r}
+pledge_age_by_cohort_trial %>% 
+  filter(!is.na(age_at_pledge)) %>% 
+  ggplot(aes(age_at_pledge, fill = pledge_type)) +
+  geom_histogram(binwidth = 2.5,boundary = 0, fill = "#0074ba", colour = "black") +
+  labs(
+    y = NULL,
+    subtitle = "Count",
+    x = "Age at pledge (Years)"
+  ) +
+  scale_y_continuous(expand = expansion(c(0,0.05)))+
+  scale_x_continuous(breaks = \(x) seq(0,x[2], 5))
+
+```
+
+Across all Trial pledgers, the mean age at pledge is `r mean(pledge_age_by_cohort_trial$age_at_pledge,na.rm=T)` years.
+
+Next, we will estimate the average age at pledging by pledger cohort:
+
+```{r}
+pledge_age_summary_trial <- pledge_age_by_cohort_trial %>% 
+  summarise(
+    number_pledges = n(),
+    number_age_provided = sum(!is.na(age_at_pledge)),
+    percent_age_provided = number_age_provided/number_pledges,
+    mean_age = mean(age_at_pledge, na.rm = T),
+    median_age = median(age_at_pledge, na.rm = T),
+    .by = pledge_cohort) %>% 
+  arrange(pledge_cohort)
+
+pledge_age_summary_trial %>% 
+  ggplot(aes(x = pledge_cohort)) +
+  geom_line(aes(y = mean_age, colour = "Mean"), linewidth = 1) +
+  geom_line(aes(y = median_age, colour = "Median"), linewidth = 1) +
+  labs(
+    subtitle = "Age (years)",
+    y = NULL,
+    x = "Year pledged",
+    colour = "Statistic"
+  ) +
+  scale_y_continuous(limits = c(0,NA), breaks = seq(0,35,5))+
+  scale_x_continuous(breaks = \(x) 2009:x[2])
+```
+
+```{r}
+
+pledge_age_summary_trial %>% 
+  gt(caption = "Pledge age statistics by Trial Pledge start year") %>% 
+  cols_label_with(fn = ~str_to_sentence(str_replace_all(.x,"_"," "))) %>% 
+  fmt_percent(contains("percent")) %>% 
+  fmt_number(ends_with("_age"))
+
+```
+
+
+## Average annual 10% pledge donations
+
+Here, I aim to model how average annual donations of 10% pledgers change over time. In our previous evaluation, we concluded from the available data that there was no decay in average pledge donations over time. Here we seek to re-investigate this.
+
+First let's create a dataframe with one row for each full year that has been experienced by pledgers who pledged between 2009 and 2023. We will only include up to pledge years that started in 2023. As usual, we will exclude pledgers whose average annual recorded donations exceed $1M
+
+```{r}
+# Identify pledges we want to include
+filtered_pledges <- tbl(con, in_schema("pledges", "verified_active_pledge")) %>% 
+  mutate(
+     start_date = lower(period),
+    pledge_cohort = year(start_date)
+        ) %>% 
+  filter(
+    pledge_type == "giving_what_we_can", # 10% Pledges
+    between(pledge_cohort,2009, 2023),
+    !id %in% average_1M_pledgers$pledge_id
+  ) 
+
+# Get donations by pledge year for each of these pledges
+pledger_donations_by_year_since_pledge <- filtered_pledges %>% 
+  inner_join(giving_report_inf_adj, by = join_by(id == pledge_id)) %>% 
+  filter(donation_date >=start_date) %>% 
+  mutate(years_since_pledge = date_part("year", age(donation_date, start_date))) %>% 
+  summarise(
+    amount_adj_norm = sum(amount_adj_norm, na.rm = T),
+    .by = c(years_since_pledge, id)
+  ) %>% 
+  collect()
+
+
+# Create a dataframe that includes all years for all pledgers and join the yearly donations
+pledge_years <- filtered_pledges %>% 
+  select(id, pledge_cohort) %>% 
+  collect() %>% 
+  reframe(years_since_pledge = 0:(2023-pledge_cohort),.by = c(id, pledge_cohort)) %>% 
+  left_join(pledger_donations_by_year_since_pledge, by = join_by(id, years_since_pledge)) %>%
+  # Where no donations are recorded for a pledger in a year, set the amount to 0
+  mutate(amount_adj_norm = coalesce(amount_adj_norm,0))
+```
+
+Next, let's report average donations by pledge cohort and years since pledging. First I'll create a table with this raw data, for reference: 
+
+```{r}
+donations_by_year <- pledge_years %>% 
+  summarise(
+    average_donations_all = mean(amount_adj_norm),
+    average_donations_recorded = mean(amount_adj_norm[amount_adj_norm>0]),
+    num_pledgers = n(),
+    num_any_donations_recorded = sum(amount_adj_norm > 0),
+    percent_any_donations_recorded = num_any_donations_recorded/num_pledgers,
+    .by = c(pledge_cohort, years_since_pledge)
+    ) %>% 
+  arrange(pledge_cohort, years_since_pledge)
+
+
+donations_by_year %>% 
+  gt() %>% 
+  cols_label_with(fn=\(x) str_to_sentence(str_replace_all(x,"_"," "))) %>% 
+  fmt_percent(percent_any_donations_recorded) %>% 
+  fmt_currency(starts_with("average_donations"), suffixing = T) %>% 
+  cols_label_with(starts_with("average_donations"), ~ str_c(.x," (2024 USD)"))
+```
+
+In our previous evaluation, we attempted to determine the trend in average pledge donations over time by focusing on the overall average in pledge donations across all pledgers (including those who do not report). Here we attempt to separate out the average pledge donations among pledgers who record donations and the percentage of pledgers who report donations and model these separately. 
+
+
+
+
+### Component 1: Average annual recorded donations among recorded pledgers
+
+First we can plot how average donations trended over time for those pledgers who recorded donations. We will separae pledgers into groups of cohorts based on when they started their pledge: 
+
+```{r}
+slice_cohorts <- function(x, cut_years = c(2008,2016,2019,2023)) {
+  
+  upper_bounds <- tail(cut_years, -1)
+  lower_bounds <- head(cut_years, -1)+1
+  
+  cut_labels <- sapply(1:length(upper_bounds), \(i) str_c(lower_bounds[i], "–", upper_bounds[i]))
+
+  cut(x, cut_years, cut_labels)
+  }
+
+
+donations_by_year_cohort <- pledge_years %>% 
+  mutate(pledge_cohort_group = slice_cohorts(pledge_cohort, c(2008,2012,2016,2019,2023))) %>% 
+  bind_rows(pledge_years) %>% 
+  mutate(pledge_cohort_group = fct_na_value_to_level(pledge_cohort_group, "All")) %>% 
+   summarise(
+    average_donations_all = mean(amount_adj_norm),
+    average_donations_recorded = mean(amount_adj_norm[amount_adj_norm>0]),
+    num_pledgers = n(),
+    num_any_donations_recorded = sum(amount_adj_norm > 0),
+    percent_any_donations_recorded = num_any_donations_recorded/num_pledgers,
+    .by = c(years_since_pledge,pledge_cohort_group)
+    )
+```
+
+
+```{r}
+donations_by_year_cohort %>% 
+  ggplot(aes(x = years_since_pledge, y = average_donations_recorded, colour = pledge_cohort_group)) +
+  geom_line()+
+  geom_point() +
+  geom_line() +
+  scale_y_continuous(
+    limits = c(0,NA), 
+    labels = scales::label_currency(scale = 1e-3, suffix = "K"),
+    breaks = \(x) seq(0,x[2],5e3)) +
+  labs(x = "Years since pledge", y = NULL, 
+       
+       subtitle = "Average annual donations among those who recorded any [2024 USD]",
+       colour = "Cohorts")
+```
+
+The 2009 to 2012 cohorts are based on much smaller numbers and see much more dramatic swings. They don't seem very representative of the later cohorts. Let's look at this plot again, without this group:
+
+```{r}
+donations_by_year_cohort %>% 
+  filter(!pledge_cohort_group %in% c("2009–2012", "All")) %>% 
+  ggplot(aes(x = years_since_pledge, y = average_donations_recorded, colour = pledge_cohort_group)) +
+  geom_line()+
+  geom_point() +
+  geom_line() +
+  scale_y_continuous(
+    limits = c(0,NA), 
+    labels = scales::label_currency(scale = 1e-3, suffix = "K"),
+    breaks = \(x) seq(0,x[2],5e3)) +
+  labs(x = "Years since pledge", y = NULL, 
+       subtitle = "Average annual donations among those who recorded any [2024 USD]",
+       colour = "Cohorts") +
+  scale_x_continuous(breaks = \(x) seq(0,x[2],1))
+```
+
+Looking at this, it appears there is was an initial increase in average annual donations among pledgers who record donations for the 2013--2016 group and the 2017--2019 group. This increase was less noticeable for the 2020--2023 group of cohorts, which are likely the most representative of the current generation of pledgers. 
+
+Let's look at the more recent cohorts on a cohort level rather than in aggregate: 
+
+```{r}
+donations_by_year <- pledge_years %>% 
+   summarise(
+    average_donations_all = mean(amount_adj_norm),
+    average_donations_recorded = mean(amount_adj_norm[amount_adj_norm>0]),
+    num_pledgers = n(),
+    num_any_donations_recorded = sum(amount_adj_norm > 0),
+    percent_any_donations_recorded = num_any_donations_recorded/num_pledgers,
+    .by = c(years_since_pledge,pledge_cohort)
+    )
+```
+
+```{r}
+donations_by_year%>% 
+  filter(pledge_cohort >= 2017) %>% 
+  mutate(pledge_cohort_group = slice_cohorts(pledge_cohort, c(2008,2012,2016,2019,2023))) %>% 
+
+  ggplot(aes(x = years_since_pledge, y = average_donations_recorded, 
+             colour = pledge_cohort_group, group = factor(pledge_cohort))) +
+  geom_line()+
+  geom_point() +
+  geom_line() +
+  scale_y_continuous(
+    limits = c(0,NA), 
+    labels = scales::label_currency(scale = 1e-3, suffix = "K"),
+    breaks = \(x) seq(0,x[2],5e3)) +
+  scale_x_continuous(breaks = \(x) seq(0,x[2],1))+
+  labs(x = "Years since pledge", y = NULL, 
+       subtitle = "Average annual donations among those who recorded any [2024 USD]",
+       colour = "Cohort group")
+  
+```
+
+Eyeballing these results, average donations among recording pledgers for the most recent cohorts do seem notably more stable than they did for the 2017 to 2019 cohorts. Based on these results, I will assume that average donations among recording donations are relatively stable for reporting donors. As such, I will model the average amount that recording pledgers give annually as a constant. I will calculate this constant as the average the annual donations of recording active 10% pledgers who pledged between 2020 and 2023.
+
+```{r}
+pledge_years %>% 
+  filter(between(pledge_cohort,2020,2023)) %>% 
+   summarise(
+    average_donations_recorded = mean(amount_adj_norm[amount_adj_norm>0])
+    ) %>% 
+  gt(caption = "Average annual donations among recording pledgers (pledge cohorts 2020–2023)") %>% 
+  cols_label(1 ~ "Average annual donations (2024 USD)") %>% 
+  fmt_currency()
+```
+
+### Component 2: Proportion of pledgers recording donations
+
+The second component of pledge value over time is the proportion of pledgers for whom GWWC is recording donations in any given year. To get an idea of what this looks like, first we will plot the proportion of pledgers in each cohort group who reported a donation by the years since they pledged.
+
+```{r fig.height = 6, fig.width = 10}
+donations_by_year %>% 
+  ggplot(aes(x = years_since_pledge, y = percent_any_donations_recorded, colour = factor(pledge_cohort))) +
+  geom_line()+
+  geom_point() +
+  geom_line() +
+  scale_y_continuous(
+    limits = c(0,NA), 
+    labels = scales::label_percent(),
+    breaks = \(x) seq(0,x[2],0.1)) +
+  scale_x_continuous(breaks = \(x) seq(0,x[2], 1)) +
+  labs(x = "Years since pledge", y = NULL, 
+       subtitle = "Percentage of pledgers recording donations",
+       colour = "Cohorts")
+```
+
+When we include all cohorts, the plot is messy and it is difficult to identify a consistent trend. But when we separate pledgers who pledged prior to 2012, a relatively consistent trend emerges across the more recent cohorts:
+
+```{r fig.height = 6, fig.width = 10}
+donations_by_year %>% 
+  mutate(pledge_batch = if_else(pledge_cohort >=2013, "2013–2023", "2009–2012")) %>% 
+  ggplot(aes(x = years_since_pledge, y = percent_any_donations_recorded, 
+             colour  = pledge_batch, group = factor(pledge_cohort))) +
+  geom_line()+
+  geom_point() +
+  geom_line() +
+  scale_y_continuous(
+    limits = c(0,NA), 
+    labels = scales::label_percent(),
+    breaks = \(x) seq(0,x[2],0.1)) +
+  labs(x = "Years since pledge", y = NULL, 
+       
+       subtitle = "Percentage of pledgers recording donations",
+       colour = "Cohorts")
+```
+
+In this trend, about 50% or more of pledgers are reporting in their first year, but this quickly drops off at a slowing rate. possibly stabilising around 25% for most cohorts.
+
+This is even seen more clearly when we plot by the cohort groups that we used earlier:
+
+```{r}
+donations_by_year_cohort %>% 
+  filter(!pledge_cohort_group %in% c("All", "2009–2012")) %>% 
+  ggplot(aes(x = years_since_pledge, y = percent_any_donations_recorded, colour = pledge_cohort_group)) +
+  geom_line()+
+  geom_point() +
+  geom_line() +
+  scale_y_continuous(
+    limits = c(0,NA), 
+    labels = scales::label_percent(),
+    breaks = \(x) seq(0,x[2],0.1)) +
+  scale_x_continuous(breaks = \(x) seq(0,x[2], 1)) +
+  labs(x = "Years since pledge", y = NULL, 
+       subtitle = "Percentage of pledgers recording donations",
+       colour = "Cohorts")
+```
+
+This looks like a trend that we can model as part of our estimation of pledge lifetime value.
+
+The trends between the different cohorts are sufficiently similar for me to feel comfortable aggregating the cohorts when modelling the decay, which will provide us with more years of data to work with.
+
+First, let's plot the percentage of pledges reporting donations over time across all of these cohorts.
+
+```{r fig.height = 6, fig.width = 10}
+gwwc_colours <- list(yellow = "#E86F2B", orange = "#CC4115", red = "#BA2934", pink = "#DA3552", purple = "#BA175B")
+
+
+recent_pledges <- pledge_years %>% 
+  filter(pledge_cohort >=2013) %>% 
+   summarise(
+    average_donations_all = mean(amount_adj_norm),
+    average_donations_recorded = mean(amount_adj_norm[amount_adj_norm>0]),
+    num_pledgers = n(),
+    num_any_donations_recorded = sum(amount_adj_norm > 0),
+    percent_any_donations_recorded = num_any_donations_recorded/num_pledgers,
+    .by = c(years_since_pledge)
+    )
+
+y_axis2_scaling = 5e-5
+
+recent_pledges %>% 
+  ggplot(aes(x = years_since_pledge, y = percent_any_donations_recorded)) +
+  geom_col(aes(y = num_pledgers*y_axis2_scaling, 
+               fill = "Number of pledgers who experienced year")) +
+  geom_point(aes(colour = "Percentage of pledgers reporting")) +
+  geom_line(aes(colour = "Percentage of pledgers reporting"), linewidth = 1) +
+  scale_y_continuous(
+    limits = c(0,NA), 
+    labels = scales::label_percent(),
+    breaks = seq(0,1,0.1), 
+    sec.axis = sec_axis(
+      transform = ~.x/y_axis2_scaling,
+      labels = scales::label_number(),
+      breaks = \(x) seq(0,x[2],1e3),
+      name = "Number"
+  )) +
+  scale_x_continuous(breaks = \(x) seq(0,x[2], 1)) +
+  scale_colour_manual(
+    values = c(
+      "Number of pledgers who experienced year" = gwwc_colours$yellow,
+      "Percentage of pledgers reporting" = gwwc_colours$red
+      )
+    ,aesthetics = c("colour", "fill")) +
+  labs(
+    title = "Percentage of pledges with recorded donations by year since pledging",
+    subtitle = "Pledges started in 2013 or later",
+    x = "Years since pledge", 
+    y = "Percentage", 
+    colour = NULL,
+    fill = NULL
+    )
+  
+```
+
+Now, from this data, let's model the change in the percentage who donated over time. From the data we have to-date, it looks like the donations could follow an exponential decay function towards a floor. Let's fit a model to this data using a nonlinear least square method, weighting each year by the number of pledgers:
+
+
+```{r}
+# Choose start values
+start_vals <- list(y0 = 0.6, r = 0.5, c = 0.2)
+
+# Model average donations as an exponential decay with a floor, using years since pledge as predictor
+nls_model <- nls(
+  percent_any_donations_recorded ~ c + (y0-c) * (1-r) ^ years_since_pledge,
+  data = recent_pledges,
+  weights = num_pledgers,
+  start = start_vals
+)
+```
+
+Here are the summary statistics for this model:
+
+```{r}
+# Summarise model
+summary(nls_model)
+
+# Get coefficients
+coefs <- coef(nls_model)
+```
+
+Results:
+
+- y0 ≈ 59.4%: our estimated initial % of pledgers recording donations
+- r ≈ 0.48: an effective annual decay rate of ~48% in the non-floor part
+- c ≈ 27.8%: long-run asymptote (your floor)
+
+All three of these parameters are highly statistically significant.
+
+If we plot our residuals, all are relatively small in magnitude and they seem reasonably balanced around 0
+
+```{r}
+# Plot residuals of the model
+plot(recent_pledges$years_since_pledge, resid(nls_model),
+     main = "Residuals vs Years", xlab = "Years Since Pledge", ylab = "Residuals",
+     pch = 16)
+abline(h = 0, col = "red")
+```
+
+Let's plot the predicted values from this model against our observed values from the pledge data we have. Let's plot the predicted values all the way out to 35 years:
+
+```{r}
+# Predict donations over time
+
+
+predicted_data <- tibble(
+  years_since_pledge = seq(0, 35, length.out = 100),
+  ) %>% 
+  mutate(predicted_percentage_donating = coefs["c"] + (coefs["y0"]-coefs["c"]) * (1-coefs["r"]) ^ years_since_pledge)
+```
+
+```{r}
+
+recent_pledges %>% 
+  ggplot(aes(x = years_since_pledge, y = percent_any_donations_recorded)) +
+  # Plot predicted
+  geom_line(
+    data = predicted_data, 
+    aes(y = predicted_percentage_donating, colour = "Predicted"),
+    linewidth = 1) +
+  
+  # Plot observed
+  geom_point(aes(colour = "Observed [2013 to 2023 pledgers]")) +
+
+  # Format plot
+  scale_y_continuous(
+    limits = c(0,NA), 
+    labels = scales::label_percent(),
+    breaks = seq(0,1,0.1)
+    ) +
+  scale_x_continuous(breaks = \(x) seq(0,x[2], 5)) +
+  scale_colour_manual(
+    values = c(
+      "Predicted" = gwwc_colours$yellow,
+      "Observed [2013 to 2023 pledgers]" = gwwc_colours$red
+      )
+    ,aesthetics = c("colour", "fill")) +
+  labs(
+    title = "Modelling percentage of pledges with recorded donations by year since pledging",
+    subtitle = "Pledges started in 2013 or later",
+    x = "Years since pledge", 
+    y = "Percentage pledgers recording donations", 
+    colour = NULL,
+    fill = NULL
+    )
+  
+```
+
+We can't be certain that this pattern will hold — it is entirely possible that the % of reporting pledgers will drop again after a certain number of years. However, we also think it is possible that the average donations of recording pledgers could go up for recent pledgers, as has been observed for past pledgers. Rather than trying to deal with these competing considerations, we are assuming that these uncertainties approximately cancel out.
+
+Thus, our the inputs we will use for modelling pledge value over time are:
+
+```{r}
+tibble(
+  Names = c("Estimated % of 10% Pledgers recording donations in their first year",
+            "Estimated annual decay rate in % of 10% Pledgers recording donations",
+            "Estimated floor in % of 10% Pledgers recording donations"),
+  Coefficients = coefs 
+) %>% 
+  gt(caption = "Parameters for predicting percentage of 10% Pledgers recording donations by year since pledging") %>% 
+  fmt_percent()
+
+```
+
+
+
+```{r}
+knitr::knit_exit()
+```
+
+
+
